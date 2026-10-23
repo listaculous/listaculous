@@ -65,7 +65,8 @@
     }
     if (destroyed) return;
     // Fast polling while running; slower while DNS verification is pending.
-    const pending = setup.status === 'applied' && setup.verification && setup.verification.dkim !== 'SUCCESS';
+    const v = setup.verification;
+    const pending = setup.status === 'applied' && v && (v.dkim !== 'SUCCESS' || v.mail_from !== 'SUCCESS');
     if (setup.status === 'running') poll = setTimeout(refresh, 1500);
     else if (pending) poll = setTimeout(refresh, 20000);
   }
@@ -205,6 +206,7 @@
         {/each}
       </div>
       {#if setup.status === 'error'}<Alert kind="error">Setup stopped: {setup.state.error}. Fix the cause and run it again. Steps already done are skipped.</Alert>{/if}
+      {#if setup.verification_error}<Alert kind="warn">{setup.verification_error}</Alert>{/if}
       {#if setup.verification}
         <div class="actions" style="margin:4px 0 16px">
           <span class="badge {verified(setup.verification.dkim) ? 'confirmed' : 'pending'}">DKIM {setup.verification.dkim?.toLowerCase()}</span>

@@ -437,6 +437,7 @@ paths:
                   state:
                     type: object
                     description: '`plan`, per-step `steps` ({status, detail, at}), created `resources`, and `error`.'
+                  verification_error: { type: string, description: Set when the live verification check failed (the saved state is still returned). }
                   verification:
                     type: object
                     properties:

@@ -854,9 +854,20 @@ async fn run(
     // Keys are kept per AWS account + IAM user, so switching accounts back and forth reuses them.
     let key_slot = format!("{account_id}/{}", t.iam_user);
     let saved = state["resources"]["sender_keys"][&key_slot].clone();
-    let reusable = saved["access_key_id"]
-        .as_str()
-        .is_some_and(|k| !k.is_empty());
+    // Only reuse it if AWS still has it as an active key of this user (it may have been deleted or
+    // deactivated, or the user recreated); otherwise mint a replacement.
+    let reusable = match saved["access_key_id"].as_str().filter(|k| !k.is_empty()) {
+        Some(saved_id) => {
+            let xml = aws
+                .query(
+                    "iam",
+                    &[("Action", "ListAccessKeys"), ("UserName", &t.iam_user)],
+                )
+                .await?;
+            active_keys(&xml).iter().any(|k| k == saved_id)
+        }
+        None => false,
+    };
     let (key_id, secret) = if reusable {
         (
             saved["access_key_id"]
@@ -913,6 +924,15 @@ async fn run(
     )
     .await?;
     Ok(())
+}
+
+/// Active access key ids from an IAM `ListAccessKeys` response.
+fn active_keys(xml: &str) -> Vec<String> {
+    xml.split("<member>")
+        .skip(1)
+        .filter(|m| xml_tag(m, "Status").as_deref() == Some("Active"))
+        .filter_map(|m| xml_tag(m, "AccessKeyId"))
+        .collect()
 }
 
 /// Points the site at the new SES credentials, as one transaction that first re-asserts this run
@@ -1041,12 +1061,22 @@ async fn status_json(
     let mut out = json!({ "status": status, "state": state });
     if verify {
         if let (Some(aws), Some(identity)) = (aws, state["plan"]["identity"].as_str()) {
-            if let Some(info) = identity_info(aws, identity).await.map_err(aws_err)? {
-                out["verification"] = json!({
-                    "dkim": info["DkimAttributes"]["Status"],
-                    "mail_from": info["MailFromAttributes"]["MailFromDomainStatus"],
-                    "verified_for_sending": info["VerifiedForSendingStatus"],
-                });
+            // A failed live check (e.g. the setup key was deleted, as recommended) must not hide
+            // the saved run; report it separately.
+            match identity_info(aws, identity).await {
+                Ok(Some(info)) => {
+                    out["verification"] = json!({
+                        "dkim": info["DkimAttributes"]["Status"],
+                        "mail_from": info["MailFromAttributes"]["MailFromDomainStatus"],
+                        "verified_for_sending": info["VerifiedForSendingStatus"],
+                    });
+                }
+                Ok(None) => {
+                    out["verification_error"] = format!("{identity} no longer exists in SES").into()
+                }
+                Err(e) => {
+                    out["verification_error"] = format!("couldn't check verification: {e}").into()
+                }
             }
         }
     }
@@ -1072,11 +1102,19 @@ pub async fn status(
             let region = load_state(&st, id)
                 .await?
                 .and_then(|(_, s, _)| s["plan"]["region"].as_str().map(str::to_string));
-            Some(
-                integrations::load(&st, &user, i)
-                    .await?
-                    .aws(&st.http, region.as_deref())?,
-            )
+            // A removed integration shouldn't hide the saved run: report it as a verification error.
+            match integrations::load(&st, &user, i)
+                .await
+                .and_then(|int| int.aws(&st.http, region.as_deref()))
+            {
+                Ok(aws) => Some(aws),
+                Err(e) => {
+                    let mut out = status_json(&st, id, false, None).await?;
+                    out["verification_error"] =
+                        format!("couldn't check verification: {}", e.message).into();
+                    return Ok(Json(out));
+                }
+            }
         }
         None => None,
     };
@@ -1319,6 +1357,19 @@ mod tests {
             .unwrap();
         assert_eq!(kind, "ses");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_active_access_keys() {
+        let xml = "<ListAccessKeysResult><AccessKeyMetadata>\
+            <member><UserName>u</UserName><AccessKeyId>AKIA1</AccessKeyId><Status>Inactive</Status></member>\
+            <member><UserName>u</UserName><AccessKeyId>AKIA2</AccessKeyId><Status>Active</Status></member>\
+            </AccessKeyMetadata></ListAccessKeysResult>";
+        assert_eq!(active_keys(xml), vec!["AKIA2".to_string()]);
+        assert!(
+            active_keys("<ListAccessKeysResult><AccessKeyMetadata/></ListAccessKeysResult>")
+                .is_empty()
+        );
     }
 
     #[test]
