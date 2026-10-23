@@ -68,8 +68,13 @@ if [ "$KEYS" -ge 2 ]; then
   echo "  aws iam delete-access-key --user-name $USER_NAME --access-key-id <AccessKeyId>" >&2
   exit 1
 fi
-read -r KEY_ID SECRET < <(aws iam create-access-key --user-name "$USER_NAME" \
+# Ignore Ctrl-C / TERM (in this shell and the AWS CLI, which inherits it) while the key is being
+# created: once AWS has made it, we must receive the secret before anything else can happen.
+trap '' INT TERM
+CREATED=$(aws iam create-access-key --user-name "$USER_NAME" \
   --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text)
+read -r KEY_ID SECRET <<<"$CREATED"
+trap 'exit 130' INT TERM
 echo "Created access key $KEY_ID"
 
 if [ -n "${LISTACULOUS_API_KEY:-}" ]; then
