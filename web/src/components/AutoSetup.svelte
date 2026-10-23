@@ -44,6 +44,11 @@
       awsId = last.aws_integration_id;
       dnsId = last.dns_integration_id && integrations.some((i) => i.id === last.dns_integration_id) ? String(last.dns_integration_id) : '';
       region = last.region ?? region;
+    } else if (last) {
+      // The account this setup used was disconnected: don't silently verify with another one
+      // (the same identity could exist there). Ask for an explicit choice.
+      awsId = null;
+      error = 'The AWS account used for this setup was disconnected. Choose an AWS account to check verification or run setup again.';
     }
     await refresh();
   }
@@ -207,7 +212,8 @@
   {:else}
     <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin-bottom:4px">
       <label class="field">AWS account
-        <select bind:value={awsId} onchange={selectionChanged} disabled={busy}>
+        <select bind:value={awsId} onchange={() => { error = ''; selectionChanged(); }} disabled={busy}>
+          {#if awsId === null}<option value={null} disabled>Choose an AWS account…</option>{/if}
           {#each integrations.filter((i) => i.kind === 'aws') as i (i.id)}<option value={i.id}>{i.name}</option>{/each}
         </select>
       </label>

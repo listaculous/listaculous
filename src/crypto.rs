@@ -66,6 +66,11 @@ fn key_file(database_url: &str) -> anyhow::Result<Vec<u8>> {
     let _ = std::fs::remove_file(&tmp);
     match linked {
         Ok(()) => {
+            // Make the new directory entry durable before any data is encrypted with this key.
+            #[cfg(unix)]
+            std::fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .context("syncing key directory")?;
             tracing::warn!(
                 "generated encryption key at {} — back it up with your database",
                 file.display()

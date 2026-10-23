@@ -467,8 +467,18 @@ async fn build_plan(
         "action": if feedback_done { "exists" } else if t.webhook_public { "create" } else { "skip" },
         "note": if t.webhook_public || feedback_done { Value::Null } else { json!(format!("BASE_URL ({}) must be a public https:// URL for AWS to reach the webhook; re-run setup after deploying", st.cfg.base_url)) } }));
     let current = crate::crypto::open_config(&t.site.provider_config).unwrap_or_default();
+    // "exists" only if the site already sends with the key this setup created for *this* AWS
+    // account, region and identity (the config set name alone doesn't change across those).
+    let saved_state = load_state(st, t.site.id)
+        .await?
+        .map(|(_, s, _)| s)
+        .unwrap_or_default();
+    let slot = &saved_state["resources"]["sender_keys"][format!("{account_id}/{}", t.iam_user)];
     let sender_done = t.site.provider_kind == "ses"
-        && current["configuration_set"].as_str() == Some(t.config_set.as_str());
+        && current["configuration_set"].as_str() == Some(t.config_set.as_str())
+        && current["region"].as_str() == Some(aws.region.as_str())
+        && slot["access_key_id"].as_str().is_some()
+        && current["access_key_id"].as_str() == slot["access_key_id"].as_str();
     steps.push(json!({ "id": "sender", "title": format!("Create send-only IAM user {} and switch the site to it", t.iam_user),
         "action": if sender_done { "exists" } else { "create" } }));
 
