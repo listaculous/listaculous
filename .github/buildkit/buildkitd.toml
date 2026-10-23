@@ -1,0 +1,5 @@
+# Persistent CI builder: keeps cargo/npm cache mounts and layers between builds, but caps disk use.
+[worker.oci]
+  gc = true
+  reservedSpace = "5GB"
+  maxUsedSpace = "12GB"

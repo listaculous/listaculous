@@ -18,7 +18,21 @@ Lightweight, self-hosted newsletter manager. Rust + Svelte + SQLite (or Postgres
 - Campaign editor with live preview, test sends, rate-limited background sending that resumes after restarts, pause/resume
 - CSV import/export, subscriber search
 
-## Quick start (Docker)
+## Install (published image)
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GitHub Container Registry on every merge to `main`: `ghcr.io/listaculous/listaculous` with tags `latest`, the version (e.g. `0.1.0`, `0.1`) and `sha-<commit>`.
+
+```sh
+mkdir listaculous && cd listaculous
+curl -fsSLO https://raw.githubusercontent.com/listaculous/listaculous/main/deploy/docker-compose.yml
+curl -fsSL  https://raw.githubusercontent.com/listaculous/listaculous/main/deploy/.env.example -o .env
+# edit .env: set BASE_URL to your public https:// URL
+docker compose up -d
+```
+
+Then create your admin account right away (the first visitor to an instance without one can create it). For HTTPS, put it behind a reverse proxy; [`deploy/Caddyfile`](deploy/Caddyfile) is a ready-made Caddy config with security headers. Update with `docker compose pull && docker compose up -d`.
+
+## Quick start from source (Docker)
 
 ```sh
 make up        # builds, starts, waits for health, opens the browser
