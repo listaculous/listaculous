@@ -305,13 +305,32 @@ async fn build_plan(
         "content": "v=DMARC1; p=none", "action": if manual { "manual" } else if has_dmarc { "exists" } else { "create" },
         "note": if has_dmarc { "existing DMARC policy kept" } else { "monitoring-only policy; tighten later" } }));
 
-    steps.push(json!({ "id": "mail_from", "title": format!("Use {} as the MAIL FROM domain (SPF alignment)", t.mail_from), "action": "create" }));
+    // Report what's already in place so a re-run plan reads accurately (all read-only checks).
+    let mail_from_done = identity.as_ref().and_then(|i| i["MailFromAttributes"]["MailFromDomain"].as_str()) == Some(t.mail_from.as_str());
+    steps.push(json!({ "id": "mail_from", "title": format!("Use {} as the MAIL FROM domain (SPF alignment)", t.mail_from),
+        "action": if mail_from_done { "exists" } else { "create" } }));
+    let dns_action = if manual {
+        "manual"
+    } else if records.iter().any(|r| r["action"] == "conflict") {
+        "conflict"
+    } else if records.iter().all(|r| r["action"] == "exists") {
+        "exists"
+    } else {
+        "create"
+    };
     steps.push(json!({ "id": "dns", "title": if manual { "Add the DNS records below at your DNS provider".to_string() } else { format!("Add DNS records in {}", dns_int.map(|d| d.name.as_str()).unwrap_or("")) },
-        "action": if manual { "manual" } else if records.iter().any(|r| r["action"] == "conflict") { "conflict" } else { "create" } }));
+        "action": dns_action }));
+    let feedback_done = match aws.ses("GET", &format!("/v2/email/configuration-sets/{}/event-destinations", t.config_set), None).await {
+        Ok(v) => v["EventDestinations"].as_array().is_some_and(|d| d.iter().any(|e| e["Name"] == EVENT_DESTINATION)),
+        Err(_) => false,
+    };
     steps.push(json!({ "id": "feedback", "title": "Send bounces & complaints to Listaculous (configuration set + SNS)",
-        "action": if t.webhook_public { "create" } else { "skip" },
-        "note": if t.webhook_public { Value::Null } else { json!(format!("BASE_URL ({}) must be a public https:// URL for AWS to reach the webhook; re-run setup after deploying", st.cfg.base_url)) } }));
-    steps.push(json!({ "id": "sender", "title": format!("Create send-only IAM user {} and switch the site to it", t.iam_user), "action": "create" }));
+        "action": if feedback_done { "exists" } else if t.webhook_public { "create" } else { "skip" },
+        "note": if t.webhook_public || feedback_done { Value::Null } else { json!(format!("BASE_URL ({}) must be a public https:// URL for AWS to reach the webhook; re-run setup after deploying", st.cfg.base_url)) } }));
+    let current = crate::crypto::open_config(&t.site.provider_config).unwrap_or_default();
+    let sender_done = t.site.provider_kind == "ses" && current["configuration_set"].as_str() == Some(t.config_set.as_str());
+    steps.push(json!({ "id": "sender", "title": format!("Create send-only IAM user {} and switch the site to it", t.iam_user),
+        "action": if sender_done { "exists" } else { "create" } }));
 
     let sandbox = !account["ProductionAccessEnabled"]
         .as_bool()
