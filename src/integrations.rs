@@ -134,6 +134,12 @@ pub async fn create(
     user: AuthUser,
     Json(c): Json<CreateIntegration>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
+    if user.scope == crate::api_keys::SCOPE_AWS_SETUP && c.kind != "aws" {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "this API key can only connect an AWS account",
+        ));
+    }
     let str_field = |k: &str| c.config[k].as_str().unwrap_or_default().trim().to_string();
     let (config, details, default_name) = match c.kind.as_str() {
         "aws" => {
@@ -189,16 +195,24 @@ pub async fn create(
     let mut sealed = config.clone();
     crate::crypto::seal_config(&mut sealed)?;
     let created_at = now();
-    let (id,): (i64,) = sqlx::query_as(
-        "INSERT INTO integrations (account_id, kind, name, config, details, created_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+    let mut details = details;
+    // A setup key is recorded on the integration so the page can tell that *its* attempt connected.
+    let setup_key = (user.scope == crate::api_keys::SCOPE_AWS_SETUP)
+        .then_some(user.api_key_id)
+        .flatten();
+    if let Some(k) = setup_key {
+        details["setup_key_id"] = k.into();
+    }
+    let id = insert(
+        &st.db,
+        user.account_id,
+        &c.kind,
+        &name,
+        &sealed,
+        &details,
+        &created_at,
+        setup_key,
     )
-    .bind(user.account_id)
-    .bind(&c.kind)
-    .bind(&name)
-    .bind(sealed.to_string())
-    .bind(details.to_string())
-    .bind(&created_at)
-    .fetch_one(&st.db)
     .await?;
     Ok((
         StatusCode::CREATED,
@@ -211,6 +225,49 @@ pub async fn create(
             &created_at,
         )),
     ))
+}
+
+/// Inserts an integration. With a single-use setup key, the key is consumed in the same
+/// transaction: it must still exist (not used by a concurrent request, not revoked/cancelled
+/// meanwhile, not expired), otherwise nothing is inserted.
+#[allow(clippy::too_many_arguments)]
+async fn insert(
+    db: &crate::db::Db,
+    account_id: i64,
+    kind: &str,
+    name: &str,
+    sealed: &Value,
+    details: &Value,
+    created_at: &str,
+    setup_key: Option<i64>,
+) -> AppResult<i64> {
+    let mut tx = db.begin().await?;
+    if let Some(key) = setup_key {
+        let r = sqlx::query("DELETE FROM api_keys WHERE id = $1 AND scope = 'aws_setup' AND (expires_at IS NULL OR expires_at > $2)")
+            .bind(key)
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
+        if r.rows_affected() != 1 {
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                "this setup key was already used, revoked or expired; get a new setup command",
+            ));
+        }
+    }
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO integrations (account_id, kind, name, config, details, created_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+    )
+    .bind(account_id)
+    .bind(kind)
+    .bind(name)
+    .bind(sealed.to_string())
+    .bind(details.to_string())
+    .bind(created_at)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(id)
 }
 
 pub async fn remove(
@@ -268,4 +325,111 @@ pub fn setup_policy() -> Value {
 
 pub async fn aws_policy(_user: AuthUser) -> Json<Value> {
     Json(setup_policy())
+}
+
+const AWS_SETUP_SCRIPT: &str = include_str!("scripts/aws-setup.sh");
+
+/// A bash script that creates the setup IAM user with the AWS CLI (policy embedded, so it always
+/// matches `setup_policy`), optionally connecting it to this server via an API key.
+pub fn aws_setup_script(base_url: &str, region: &str) -> String {
+    let region = if region
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !region.is_empty()
+    {
+        region
+    } else {
+        "us-east-1"
+    };
+    AWS_SETUP_SCRIPT
+        .replace(
+            "__POLICY__",
+            &serde_json::to_string_pretty(&setup_policy()).unwrap_or_default(),
+        )
+        .replace("__URL__", base_url)
+        .replace("__REGION__", region)
+}
+
+#[derive(Deserialize, Default)]
+pub struct ScriptQuery {
+    #[serde(default)]
+    pub region: String,
+}
+
+pub async fn aws_script(
+    State(st): State<AppState>,
+    _user: AuthUser,
+    axum::extract::Query(q): axum::extract::Query<ScriptQuery>,
+) -> impl axum::response::IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/x-shellscript; charset=utf-8",
+        )],
+        aws_setup_script(&st.cfg.base_url, &q.region),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    /// A setup key connects at most one account: a second (concurrent) use, or a use after the
+    /// key was revoked mid-verification, inserts nothing.
+    #[tokio::test]
+    async fn setup_key_is_consumed_exactly_once() {
+        let path = std::env::temp_dir().join(format!("lc-int-{}.db", crate::db::random_token(8)));
+        let db = crate::db::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO accounts (name, created_at) VALUES ('a', 'now')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (account_id, email, password_hash, created_at) VALUES (1, 'a@b.c', 'x', 'now')").execute(&db).await.unwrap();
+        for (id, scope) in [(1, "aws_setup"), (2, "aws_setup")] {
+            sqlx::query("INSERT INTO api_keys (id, user_id, name, prefix, token_hash, created_at, scope) VALUES ($1, 1, 'k', 'p', $2, 'now', $3)")
+                .bind(id as i64).bind(format!("h{id}")).bind(scope).execute(&db).await.unwrap();
+        }
+        let cfg = json!({});
+        let first = super::insert(&db, 1, "aws", "A", &cfg, &cfg, "now", Some(1));
+        let second = super::insert(&db, 1, "aws", "B", &cfg, &cfg, "now", Some(1));
+        let (a, b) = tokio::join!(first, second);
+        assert_eq!(
+            [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
+            1,
+            "exactly one concurrent use wins"
+        );
+
+        // Revoked (e.g. cancelled) while the AWS check was running: nothing inserted.
+        sqlx::query("DELETE FROM api_keys WHERE id = 2")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(
+            super::insert(&db, 1, "aws", "C", &cfg, &cfg, "now", Some(2))
+                .await
+                .is_err()
+        );
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM integrations")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn script_embeds_current_policy_and_url() {
+        let s = super::aws_setup_script("https://lc.example.com", "eu-west-1");
+        assert!(!s.contains("__POLICY__") && !s.contains("__URL__") && !s.contains("__REGION__"));
+        assert!(s.contains(r#"LISTACULOUS_URL="https://lc.example.com""#));
+        assert!(
+            s.contains("ses:CreateEmailIdentity")
+                && s.contains("arn:aws:iam::*:user/listaculous/*")
+        );
+        assert!(s.contains("${LISTACULOUS_SES_REGION:-eu-west-1}"));
+        // An unsafe region can't inject into the script.
+        assert!(super::aws_setup_script("https://x", "a\"; rm -rf /").contains(":-us-east-1}"));
+    }
 }
