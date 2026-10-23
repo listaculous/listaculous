@@ -1,7 +1,7 @@
 # Builds the multi-arch image and publishes it to GHCR on every merge to main.
 #
-# Runs on self-hosted runners (the Mac mini first, Beast as backup) so the persistent BuildKit
-# cache makes rebuilds take well under a minute. Only `push` to main (and manual dispatch by a
+# Runs on the self-hosted runners (Mac mini or Beast, whichever is free) so the persistent
+# BuildKit cache makes rebuilds take well under a minute. Only `push` to main (and manual dispatch by a
 # maintainer) can reach these machines; pull requests never run here (see ci.yml).
 name: Release image
 
@@ -25,39 +25,27 @@ env:
   PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
-  # Picks the primary runner if it's online, else the backup. (A job aimed at an offline runner
-  # would just queue, so this has to be decided before the build job starts.) Without the
-  # RUNNER_STATUS_TOKEN secret it falls back to "any listaculous runner".
-  pick-runner:
+  build:
     # Manual runs can pick any branch; only main may publish the production tags.
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    outputs:
-      labels: ${{ steps.pick.outputs.labels }}
-    steps:
-      - id: pick
-        env:
-          GH_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          pick='["self-hosted","listaculous"]'
-          if [ -n "$GH_TOKEN" ]; then
-            online=$(gh api "repos/$REPO/actions/runners" --jq '[.runners[] | select(.status=="online") | .labels[].name]' 2>/dev/null || echo '[]')
-            if echo "$online" | grep -q '"primary"'; then pick='["self-hosted","listaculous","primary"]'
-            elif echo "$online" | grep -q '"backup"'; then pick='["self-hosted","listaculous","backup"]'
-            fi
-          fi
-          echo "Using runner labels: $pick"
-          echo "labels=$pick" >> "$GITHUB_OUTPUT"
-
-  build:
-    needs: pick-runner
-    if: github.ref == 'refs/heads/main'
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.labels) }}
+    # Any idle self-hosted Listaculous runner (the Mac mini or Beast).
+    runs-on: [self-hosted, listaculous]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      - name: CI Docker config
+        run: |
+          # A dedicated Docker config without a credential helper: Docker Desktop's macOS Keychain
+          # helper can't be used from a background service. It also keeps the builder list
+          # separate from the machine owner's. Plugins (buildx) are linked in from the usual place.
+          dir="$HOME/.docker-listaculous-ci"
+          mkdir -p "$dir"
+          [ -f "$dir/config.json" ] || echo '{}' > "$dir/config.json"
+          if [ -d "$HOME/.docker/cli-plugins" ] && [ ! -e "$dir/cli-plugins" ]; then
+            ln -s "$HOME/.docker/cli-plugins" "$dir/cli-plugins"
+          fi
+          echo "DOCKER_CONFIG=$dir" >> "$GITHUB_ENV"
 
       - name: Persistent builder
         run: |
@@ -104,6 +92,10 @@ jobs:
             --label org.opencontainers.image.revision=${{ github.sha }} \
             --label org.opencontainers.image.version=${{ steps.meta.outputs.version }} \
             .
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io >/dev/null 2>&1 || true
 
       - name: Summary
         run: |
