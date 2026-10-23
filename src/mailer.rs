@@ -6,12 +6,11 @@
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
-use hmac::{Hmac, Mac};
 use lettre::message::header::{HeaderName, HeaderValue};
 use lettre::message::{Mailbox, MultiPart};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+
 
 use crate::models::Site;
 
@@ -296,13 +295,6 @@ impl SesProvider {
     }
 }
 
-type HmacSha256 = Hmac<Sha256>;
-
-fn hmac(key: &[u8], data: &str) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("hmac key");
-    mac.update(data.as_bytes());
-    mac.finalize().into_bytes().to_vec()
-}
 
 #[async_trait]
 impl Provider for SesProvider {
@@ -316,60 +308,31 @@ impl Provider for SesProvider {
         let body = serde_json::to_vec(&body)
             .map_err(|e| SendError::new(FailureKind::Permanent, e.to_string()))?;
 
-        let region = &self.cfg.region;
-        let host = format!("email.{region}.amazonaws.com");
+        let host = format!("email.{}.amazonaws.com", self.cfg.region);
         let path = "/v2/email/outbound-emails";
-        let now = chrono::Utc::now();
-        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-        let date = now.format("%Y%m%d").to_string();
-        let payload_hash = hex::encode(Sha256::digest(&body));
-
-        let mut headers = vec![
-            ("content-type", "application/json".to_string()),
-            ("host", host.clone()),
-            ("x-amz-date", amz_date.clone()),
-        ];
-        if let Some(tok) = &self.session_token {
-            headers.push(("x-amz-security-token", tok.clone()));
-        }
-        let signed_headers = headers
-            .iter()
-            .map(|(k, _)| *k)
-            .collect::<Vec<_>>()
-            .join(";");
-        let canonical_headers: String = headers
-            .iter()
-            .map(|(k, v)| format!("{k}:{}\n", v.trim()))
-            .collect();
-        let canonical_request =
-            format!("POST\n{path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
-        let scope = format!("{date}/{region}/ses/aws4_request");
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        let creds = crate::aws::Creds {
+            access_key_id: self.cfg.access_key_id.clone(),
+            secret_access_key: self.cfg.secret_access_key.clone(),
+            session_token: self.session_token.clone(),
+        };
+        let signed = crate::aws::sign(
+            &creds,
+            "ses",
+            &self.cfg.region,
+            "POST",
+            path,
+            &[],
+            &[("host", host.clone()), ("content-type", "application/json".into())],
+            &body,
+            chrono::Utc::now(),
         );
-        let k_date = hmac(
-            format!("AWS4{}", self.cfg.secret_access_key).as_bytes(),
-            &date,
-        );
-        let k_region = hmac(&k_date, region);
-        let k_service = hmac(&k_region, "ses");
-        let k_signing = hmac(&k_service, "aws4_request");
-        let signature = hex::encode(hmac(&k_signing, &string_to_sign));
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
-            self.cfg.access_key_id
-        );
-
         let mut req = self
             .http
             .post(format!("https://{host}{path}"))
             .header("content-type", "application/json")
-            .header("x-amz-date", amz_date)
-            .header("authorization", authorization)
             .body(body);
-        if let Some(tok) = &self.session_token {
-            req = req.header("x-amz-security-token", tok);
+        for (k, v) in signed {
+            req = req.header(k, v);
         }
         let resp = match req.send().await {
             Ok(r) => r,
