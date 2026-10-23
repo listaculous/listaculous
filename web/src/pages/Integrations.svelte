@@ -73,7 +73,13 @@
         const keys = await api('/auth/api-keys');
         if (mine !== attempt) return;
         watchNote = '';
-        if (!keys.some((k) => k.id === cliKey.id)) {
+        const mineKey = keys.find((k) => k.id === cliKey.id);
+        if (mineKey?.expires_at && new Date(mineKey.expires_at) <= new Date()) {
+          await cancelCli({ close: false });
+          error = 'That setup command expired. Get a new one to try again.';
+          return;
+        }
+        if (!mineKey) {
           // The key is gone. It was either consumed by a successful connect (the integration
           // records which setup key created it) or revoked elsewhere.
           const keyId = cliKey.id;
@@ -112,14 +118,29 @@
     if (close) open = null;
     if (key) await revokeSetupKey(key);
   }
-  onDestroy(() => { attempt++; });
+  // Leaving the page abandons the attempt: revoke its key so the command can't be used later.
+  // (A key still being created is revoked by prepareCli once the attempt no longer matches.)
+  onDestroy(() => {
+    const key = cliKey;
+    endCli();
+    if (key) api(`/auth/api-keys/${key.id}`, { method: 'DELETE' }).catch(() => {});
+  });
 
   async function loadScript() {
-    script = await (await fetch(`/api/integrations/aws-setup-script?region=${encodeURIComponent(cliRegion)}`)).text();
-    showScript = true;
+    try {
+      const res = await fetch(`/api/integrations/aws-setup-script?region=${encodeURIComponent(cliRegion)}`);
+      if (!res.ok) throw new Error(res.status === 401 ? 'your session expired; sign in again' : `HTTP ${res.status}`);
+      script = await res.text();
+      showScript = true;
+    } catch (err) {
+      showScript = false;
+      script = '';
+      error = `Couldn't load the setup script: ${err.message}`;
+    }
   }
 
   function downloadScript() {
+    if (!script) return;
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([script], { type: 'text/x-shellscript' }));
     a.download = 'listaculous-aws-setup.sh';
