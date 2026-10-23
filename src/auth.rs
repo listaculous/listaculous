@@ -26,6 +26,11 @@ pub struct AuthUser {
     /// True when authenticated with an API key rather than a browser session.
     #[serde(skip)]
     pub via_api_key: bool,
+    /// The API key used (if any) and its scope ("" = full access).
+    #[serde(skip)]
+    pub api_key_id: Option<i64>,
+    #[serde(skip)]
+    pub scope: String,
 }
 
 impl AuthUser {
@@ -35,6 +40,8 @@ impl AuthUser {
             account_id,
             email,
             via_api_key: false,
+            api_key_id: None,
+            scope: String::new(),
         }
     }
 
@@ -68,7 +75,21 @@ impl FromRequestParts<AppState> for AuthUser {
                     .or_else(|| v.strip_prefix("bearer "))
             })
         {
-            return crate::api_keys::authenticate(state, key.trim()).await;
+            let user = crate::api_keys::authenticate(state, key.trim()).await?;
+            // Scoped keys only work on the endpoints their purpose needs.
+            // Inside the nested /api router `uri` has the prefix stripped; use the original URI.
+            let path = parts
+                .extensions
+                .get::<axum::extract::OriginalUri>()
+                .map(|o| o.0.path().to_string())
+                .unwrap_or_else(|| parts.uri.path().to_string());
+            if !crate::api_keys::scope_allows(&user.scope, &parts.method, &path) {
+                return Err(AppError::new(
+                    StatusCode::FORBIDDEN,
+                    "this API key is limited to AWS CLI setup",
+                ));
+            }
+            return Ok(user);
         }
         let jar = CookieJar::from_headers(&parts.headers);
         let token = jar
