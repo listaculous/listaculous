@@ -41,6 +41,18 @@ Put it behind a TLS reverse proxy (e.g. Caddy: `news.example.com { reverse_proxy
 5. Set the send rate to your SES per-second quota.
 6. Create a newsletter, paste the signup form from the *Signup form* tab into your site.
 
+## API
+
+Everything in the app is available over a JSON API, built so scripts and AI agents can run your newsletters.
+
+- **Docs:** open **API docs** in the sidebar, or go to `/docs` (powered by [Scalar](https://scalar.com), themed to match the app and following its Light / System / Dark switch).
+- **Spec:** `/api/openapi.json` and `/api/openapi.yaml` (OpenAPI 3.1; the source is [`openapi.yaml`](openapi.yaml)). A test fails the build if a route is missing from the spec.
+- **Auth:** create a key under **Account → API keys** and send `Authorization: Bearer lc_…`. Keys can do everything except manage passwords, passkeys and keys.
+
+```sh
+curl -H "Authorization: Bearer $LISTACULOUS_KEY" http://localhost:8080/api/sites
+```
+
 ## Configuration
 
 | Env var | Default | |
@@ -69,7 +81,7 @@ SQL is written to run on both SQLite and Postgres; migrations live in `migration
 
 ## Roadmap ideas
 
-Scheduled sends, SNS signature verification, per-site branded link domains, open/click tracking (opt-in), WYSIWYG/Markdown editor, multi-user accounts & billing for SaaS, provider webhooks for Postmark/Mailgun, encryption of stored provider secrets.
+MCP server, scheduled sends, SNS signature verification, per-site branded link domains, open/click tracking (opt-in), WYSIWYG/Markdown editor, multi-user accounts & billing for SaaS, provider webhooks for Postmark/Mailgun, encryption of stored provider secrets.
 
 ## License
 

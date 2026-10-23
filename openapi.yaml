@@ -1,0 +1,1107 @@
+openapi: 3.1.0
+info:
+  title: Listaculous API
+  version: 0.1.0
+  summary: Self-hosted, multi-site newsletter management.
+  license:
+    name: AGPL-3.0-or-later
+    identifier: AGPL-3.0-or-later
+  contact:
+    name: Listaculous
+    url: https://github.com/listaculous/listaculous
+  description: |
+    Everything the Listaculous admin app can do is available through this JSON API, so scripts and
+    AI agents can run your newsletters end to end.
+
+    ## Concepts
+
+    - **Site**: one of your websites/domains. Owns the sender identity (from name/email,
+      mailing address) and the email provider (Amazon SES, SMTP or log-only).
+    - **List** (newsletter): a newsletter on a site, with its own subscribers, public signup
+      endpoint and campaigns.
+    - **Subscription**: a person's membership in one list: `pending` (awaiting double opt-in),
+      `confirmed` or `unsubscribed`.
+    - **Subscriber**: a person (email) on a site. Site-wide status `active`, `bounced`,
+      `complained` or `suppressed`; anything but `active` is never emailed.
+    - **Campaign**: one email sent to every confirmed subscriber of a list:
+      `draft` → `sending` → `sent` (or `paused`).
+
+    ## Authentication
+
+    Create an API key in the app under **Account → API keys** and send it as a bearer token:
+
+    ```http
+    Authorization: Bearer lc_…
+    ```
+
+    Keys act as the user who created them. For safety they **cannot** manage credentials
+    (password, passkeys, API keys) — those endpoints require a browser session and return `403`
+    when called with a key. The browser app itself uses the `lc_session` cookie.
+
+    ## Typical agent workflow
+
+    1. `GET /api/sites` and `GET /api/sites/{id}/lists` to find the newsletter.
+    2. `POST /api/lists/{id}/campaigns` with `subject` and `html_body` to create a draft.
+    3. `POST /api/campaigns/{id}/preview` to check the rendered email, then
+       `POST /api/campaigns/{id}/test` to send yourself a copy.
+    4. `POST /api/campaigns/{id}/send` to deliver it, then poll `GET /api/campaigns/{id}`
+       until `status` is `sent` (watch `stats`).
+
+    ## Conventions
+
+    - Request and response bodies are JSON (`Content-Type: application/json`).
+    - Timestamps are RFC 3339 strings in UTC, e.g. `2026-10-23T16:00:08Z`.
+    - IDs are integers. Everything is scoped to your account: other accounts' IDs return `404`.
+    - Errors return a non-2xx status with `{ "error": "human readable message" }`.
+    - Sending always adds an unsubscribe link, the site's physical address and RFC 8058
+      one-click unsubscribe headers. These can't be disabled.
+
+servers:
+  - url: http://localhost:8080
+    description: Replaced at runtime with this server's BASE_URL
+
+security:
+  - apiKey: []
+  - session: []
+
+tags:
+  - name: Auth
+    description: Sign-in status, sessions and the current user.
+  - name: API keys
+    description: Bearer tokens for scripts and AI agents. Managing keys requires a browser session.
+  - name: Passkeys
+    description: WebAuthn passkey registration and sign-in (used by the web app).
+  - name: Dashboard
+  - name: Sites
+    description: Websites with their sender identity and email provider.
+  - name: Lists
+    description: Newsletters on a site.
+  - name: Subscribers
+    description: People subscribed to a list.
+  - name: Campaigns
+    description: Emails sent to a list.
+  - name: Public
+    description: |
+      Unauthenticated endpoints used by signup forms, confirmation/unsubscribe links and provider
+      webhooks. Not intended for agents, documented for completeness.
+
+paths:
+  # ------------------------------------------------------------------------------- Auth
+  /api/auth/status:
+    get:
+      tags: [Auth]
+      operationId: getAuthStatus
+      summary: Check whether first-run setup is needed
+      security: []
+      responses:
+        '200':
+          description: Setup status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [needs_setup]
+                properties:
+                  needs_setup: { type: boolean, description: True until the first admin account exists. }
+  /api/auth/setup:
+    post:
+      tags: [Auth]
+      operationId: setup
+      summary: Create the first admin account
+      description: Only works while no users exist. Starts a browser session (sets the `lc_session` cookie).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Credentials' }
+      responses:
+        '200': { $ref: '#/components/responses/User' }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { description: Setup already completed., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Sign in with email and password
+      description: Starts a browser session (sets the `lc_session` cookie). Rate limited per IP and per email.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Credentials' }
+      responses:
+        '200': { $ref: '#/components/responses/User' }
+        '401': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: End the current browser session
+      security: [{ session: [] }]
+      responses:
+        '200': { description: Signed out (the cookie is cleared). }
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: Get the authenticated user
+      description: Useful to verify an API key works.
+      responses:
+        '200': { $ref: '#/components/responses/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/auth/password:
+    post:
+      tags: [Auth]
+      operationId: changePassword
+      summary: Change password
+      description: Requires a browser session. Signs out every other session; passkeys keep working.
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 10 }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/SessionRequired' }
+
+  # ------------------------------------------------------------------------------- API keys
+  /api/auth/api-keys:
+    get:
+      tags: [API keys]
+      operationId: listApiKeys
+      summary: List API keys
+      security: [{ session: [] }]
+      responses:
+        '200':
+          description: Your API keys (tokens are never returned again after creation).
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ApiKey' } }
+        '403': { $ref: '#/components/responses/SessionRequired' }
+    post:
+      tags: [API keys]
+      operationId: createApiKey
+      summary: Create an API key
+      description: Returns the plaintext `token` exactly once. Store it securely.
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 60, example: Claude agent }
+                expires_in_days: { type: [integer, 'null'], minimum: 1, maximum: 3650, description: Omit for a key that never expires. }
+      responses:
+        '201':
+          description: Key created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiKey'
+                  - type: object
+                    required: [token]
+                    properties:
+                      token: { type: string, example: lc_k3Yb…, description: The secret. Shown only once. }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/SessionRequired' }
+  /api/auth/api-keys/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    delete:
+      tags: [API keys]
+      operationId: revokeApiKey
+      summary: Revoke an API key
+      security: [{ session: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '403': { $ref: '#/components/responses/SessionRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------------------- Passkeys
+  /api/auth/passkeys:
+    get:
+      tags: [Passkeys]
+      operationId: listPasskeys
+      summary: List your passkeys
+      security: [{ session: [] }]
+      responses:
+        '200':
+          description: Registered passkeys.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Passkey' } }
+  /api/auth/passkeys/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    put:
+      tags: [Passkeys]
+      operationId: renamePasskey
+      summary: Rename a passkey
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [name], properties: { name: { type: string, maxLength: 60 } } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+    delete:
+      tags: [Passkeys]
+      operationId: deletePasskey
+      summary: Remove a passkey
+      security: [{ session: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/auth/passkey/register/start:
+    post:
+      tags: [Passkeys]
+      operationId: startPasskeyRegistration
+      summary: Begin registering a passkey
+      description: Returns WebAuthn creation options (base64url-encoded) for `navigator.credentials.create()`.
+      security: [{ session: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/WebAuthnChallenge' }
+  /api/auth/passkey/register/finish:
+    post:
+      tags: [Passkeys]
+      operationId: finishPasskeyRegistration
+      summary: Complete passkey registration
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challenge_id, credential]
+              properties:
+                challenge_id: { type: string }
+                name: { type: string, maxLength: 60 }
+                credential: { type: object, description: The `PublicKeyCredential` from `navigator.credentials.create()`, base64url-encoded. }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/auth/passkey/login/start:
+    post:
+      tags: [Passkeys]
+      operationId: startPasskeyLogin
+      summary: Begin passkey sign-in
+      description: Usernameless (discoverable credential) WebAuthn request options.
+      security: []
+      responses:
+        '200': { $ref: '#/components/responses/WebAuthnChallenge' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/auth/passkey/login/finish:
+    post:
+      tags: [Passkeys]
+      operationId: finishPasskeyLogin
+      summary: Complete passkey sign-in
+      description: Verifies the assertion and starts a browser session.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challenge_id, credential]
+              properties:
+                challenge_id: { type: string }
+                credential: { type: object, description: The `PublicKeyCredential` from `navigator.credentials.get()`, base64url-encoded. }
+      responses:
+        '200': { $ref: '#/components/responses/User' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  # ------------------------------------------------------------------------------- Dashboard
+  /api/dashboard:
+    get:
+      tags: [Dashboard]
+      operationId: getDashboard
+      summary: Subscriber counts per list and recent campaigns
+      responses:
+        '200':
+          description: Overview across all sites.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lists, recent_campaigns]
+                properties:
+                  lists:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        site_id: { type: integer }
+                        site_name: { type: string }
+                        id: { type: integer, description: List ID }
+                        name: { type: string }
+                        confirmed: { type: integer }
+                        pending: { type: integer }
+                        unsubscribed: { type: integer }
+                  recent_campaigns: { type: array, items: { $ref: '#/components/schemas/Campaign' }, description: Last 10 campaigns (without stats). }
+
+  # ------------------------------------------------------------------------------- Sites
+  /api/sites:
+    get:
+      tags: [Sites]
+      operationId: listSites
+      summary: List sites
+      responses:
+        '200':
+          description: All sites in your account, sorted by name.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Site' } }
+    post:
+      tags: [Sites]
+      operationId: createSite
+      summary: Create a site
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SiteInput' }
+      responses:
+        '200': { $ref: '#/components/responses/Site' }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/sites/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Sites]
+      operationId: getSite
+      summary: Get a site
+      responses:
+        '200': { $ref: '#/components/responses/Site' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Sites]
+      operationId: updateSite
+      summary: Update a site
+      description: |
+        Replaces all fields. Secret provider fields (`secret_access_key`, `password`) left blank or
+        sent back as the `********` mask keep their stored value.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SiteInput' }
+      responses:
+        '200': { $ref: '#/components/responses/Site' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Sites]
+      operationId: deleteSite
+      summary: Delete a site
+      description: Permanently deletes the site with all its lists, subscribers and campaigns.
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/sites/{id}/test:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Sites]
+      operationId: sendSiteTestEmail
+      summary: Send a provider test email
+      description: Sends a short email through the site's provider to verify its configuration.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailAddress' }
+      responses:
+        '200':
+          description: Sent.
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, message_id: { type: string } } }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/sites/{id}/icon:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Sites]
+      operationId: getSiteIcon
+      summary: Get the site's favicon
+      description: |
+        The favicon fetched from the site's domain and stored by Listaculous. `404` when the site
+        has none. The site's `icon_url` points here (with a cache-busting query string).
+      responses:
+        '200':
+          description: The icon image.
+          content:
+            image/png: { schema: { type: string, format: binary } }
+            image/x-icon: { schema: { type: string, format: binary } }
+            image/svg+xml: { schema: { type: string, format: binary } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/sites/{id}/icon/refresh:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Sites]
+      operationId: refreshSiteIcon
+      summary: Re-fetch the site's favicon
+      description: |
+        Fetches the favicon from the site's domain now (this also happens automatically when a site
+        is created or its domain changes). Looks for `<link rel="icon">` / `apple-touch-icon` on the
+        home page, then `/favicon.ico`. Only public addresses are contacted.
+      responses:
+        '200': { $ref: '#/components/responses/Site' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/sites/{id}/events:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Sites]
+      operationId: listSiteEvents
+      summary: List bounces and complaints
+      description: The latest 200 bounce/complaint events received from the provider for this site.
+      responses:
+        '200':
+          description: Events, newest first.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/EmailEvent' } }
+
+  # ------------------------------------------------------------------------------- Lists
+  /api/sites/{id}/lists:
+    parameters: [{ $ref: '#/components/parameters/SiteId' }]
+    get:
+      tags: [Lists]
+      operationId: listLists
+      summary: List a site's newsletters
+      responses:
+        '200':
+          description: Lists, sorted by name.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/List' } }
+    post:
+      tags: [Lists]
+      operationId: createList
+      summary: Create a newsletter
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ListInput' }
+      responses:
+        '200': { $ref: '#/components/responses/ListWithSite' }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/lists/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Lists]
+      operationId: getList
+      summary: Get a newsletter
+      responses:
+        '200': { $ref: '#/components/responses/ListWithSite' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Lists]
+      operationId: updateList
+      summary: Update a newsletter
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ListInput' }
+      responses:
+        '200': { $ref: '#/components/responses/ListWithSite' }
+        '400': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Lists]
+      operationId: deleteList
+      summary: Delete a newsletter
+      description: Permanently deletes the list with its subscriptions and campaigns.
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+
+  # ------------------------------------------------------------------------------- Subscribers
+  /api/lists/{id}/subscribers:
+    parameters: [{ $ref: '#/components/parameters/ListId' }]
+    get:
+      tags: [Subscribers]
+      operationId: listSubscribers
+      summary: Search a newsletter's subscribers
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: Case-insensitive substring of email or name. }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/SubscriptionStatus' }, description: Filter by subscription status. }
+        - { name: page, in: query, schema: { type: integer, minimum: 0, default: 0 }, description: Zero-based page (50 per page). }
+      responses:
+        '200':
+          description: One page of subscriptions, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, total, page, page_size]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Subscription' } }
+                  total: { type: integer }
+                  page: { type: integer }
+                  page_size: { type: integer, const: 50 }
+    post:
+      tags: [Subscribers]
+      operationId: addSubscriber
+      summary: Add a subscriber (confirmed)
+      description: |
+        Adds the person as **confirmed**, skipping double opt-in. Only use this for people who have
+        explicitly agreed to receive the newsletter. Suppressed addresses are never re-added.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                name: { type: string }
+      responses:
+        '200':
+          description: Outcome.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result: { type: string, enum: [added, already_subscribed, suppressed] }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/lists/{id}/import:
+    parameters: [{ $ref: '#/components/parameters/ListId' }]
+    post:
+      tags: [Subscribers]
+      operationId: importSubscribers
+      summary: Import subscribers from CSV
+      description: |
+        CSV with `email,name` columns, or a header row naming `email`, `name` and `status` columns
+        (e.g. a Listaculous export). Rows are imported as confirmed; rows whose status isn't
+        `confirmed`, and suppressed addresses, are skipped.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [csv]
+              properties:
+                csv: { type: string, example: "email,name\njane@example.com,Jane\n" }
+      responses:
+        '200':
+          description: Import summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  added: { type: integer }
+                  skipped: { type: integer }
+                  invalid: { type: integer }
+  /api/lists/{id}/export:
+    parameters: [{ $ref: '#/components/parameters/ListId' }]
+    get:
+      tags: [Subscribers]
+      operationId: exportSubscribers
+      summary: Export subscribers as CSV
+      responses:
+        '200':
+          description: CSV with columns `email,name,status,created_at,confirmed_at`.
+          content:
+            text/csv:
+              schema: { type: string }
+  /api/subscriptions/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    delete:
+      tags: [Subscribers]
+      operationId: deleteSubscription
+      summary: Delete a subscription
+      description: Permanently removes the record (including consent). Prefer unsubscribing.
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/subscriptions/{id}/unsubscribe:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Subscribers]
+      operationId: unsubscribe
+      summary: Unsubscribe (optionally suppress)
+      description: |
+        Unsubscribes from this list. With `suppress: true` the address is also blocked site-wide:
+        unsubscribed from every list on the site and never re-added by forms or imports.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                suppress: { type: boolean, default: false }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------------------- Campaigns
+  /api/lists/{id}/campaigns:
+    parameters: [{ $ref: '#/components/parameters/ListId' }]
+    get:
+      tags: [Campaigns]
+      operationId: listCampaigns
+      summary: List a newsletter's campaigns
+      responses:
+        '200':
+          description: Campaigns with delivery stats, newest first.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/CampaignWithStats' } }
+    post:
+      tags: [Campaigns]
+      operationId: createCampaign
+      summary: Create a draft campaign
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CampaignInput' }
+      responses:
+        '200': { $ref: '#/components/responses/Campaign' }
+  /api/campaigns/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Campaigns]
+      operationId: getCampaign
+      summary: Get a campaign with delivery stats
+      responses:
+        '200': { $ref: '#/components/responses/Campaign' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Campaigns]
+      operationId: updateCampaign
+      summary: Edit a draft
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CampaignInput' }
+      responses:
+        '200': { $ref: '#/components/responses/Campaign' }
+        '400': { description: Not a draft., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: Started sending while the edit was in flight; changes were not saved., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    delete:
+      tags: [Campaigns]
+      operationId: deleteCampaign
+      summary: Delete a campaign
+      description: Not allowed while `sending` (pause first).
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/campaigns/{id}/preview:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Campaigns]
+      operationId: previewCampaign
+      summary: Render a preview
+      description: Renders the given content (not necessarily saved) exactly as a subscriber would receive it, including the footer.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CampaignInput' }
+      responses:
+        '200':
+          description: Rendered email.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subject: { type: string }
+                  html: { type: string }
+                  text: { type: string }
+  /api/campaigns/{id}/test:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Campaigns]
+      operationId: sendCampaignTest
+      summary: Send a test copy
+      description: Sends the saved campaign to one address with a `[TEST]` subject prefix.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailAddress' }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/campaigns/{id}/send:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Campaigns]
+      operationId: sendCampaign
+      summary: Send, resume or retry
+      description: |
+        - **draft** → queues every confirmed, active subscriber and starts sending.
+        - **paused** → resumes, re-queueing recipients that failed definitively.
+        - **sent** → retries recipients that failed definitively (`400` if there are none).
+
+        Requires a subject, an HTML body and a physical address on the site. Recipients whose
+        delivery is *unknown* (provider timeout) are never retried, to avoid duplicates. Sending is
+        asynchronous: poll `GET /api/campaigns/{id}`.
+      responses:
+        '200': { $ref: '#/components/responses/Campaign' }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/campaigns/{id}/pause:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Campaigns]
+      operationId: pauseCampaign
+      summary: Pause a sending campaign
+      responses:
+        '200': { $ref: '#/components/responses/Campaign' }
+
+  # ------------------------------------------------------------------------------- Public
+  /subscribe/{public_id}:
+    parameters:
+      - { name: public_id, in: path, required: true, schema: { type: string }, description: The list's `public_id`. }
+    post:
+      tags: [Public]
+      operationId: publicSubscribe
+      summary: Signup form endpoint
+      description: |
+        Accepts an HTML form post or JSON. CORS-enabled so sites on other domains can call it.
+        Rate limited per IP. Responds identically whether or not the address was already
+        subscribed, so list membership can't be probed. `website` is a honeypot: leave it empty.
+        HTML form posts get a thank-you page (or a redirect to the list's `redirect_url`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubscribeForm' }
+          application/x-www-form-urlencoded:
+            schema: { $ref: '#/components/schemas/SubscribeForm' }
+      responses:
+        '200':
+          description: Accepted.
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean }, message: { type: string } } }
+            text/html: { schema: { type: string } }
+        '400': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /confirm/{token}:
+    parameters: [{ $ref: '#/components/parameters/Token' }]
+    get:
+      tags: [Public]
+      operationId: confirmSubscription
+      summary: Double opt-in confirmation link
+      security: []
+      responses:
+        '200': { description: HTML confirmation page., content: { text/html: { schema: { type: string } } } }
+  /unsubscribe/{token}:
+    parameters: [{ $ref: '#/components/parameters/Token' }]
+    get:
+      tags: [Public]
+      operationId: unsubscribePage
+      summary: Unsubscribe page
+      description: Shows a confirmation button; GET never unsubscribes (link scanners prefetch URLs).
+      security: []
+      responses:
+        '200': { description: HTML page., content: { text/html: { schema: { type: string } } } }
+    post:
+      tags: [Public]
+      operationId: unsubscribeOneClick
+      summary: Unsubscribe (form button or RFC 8058 one-click)
+      security: []
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                List-Unsubscribe: { type: string, const: One-Click, description: Sent by mailbox providers (RFC 8058). }
+                scope: { type: string, enum: [list, all], description: '`all` unsubscribes from every list on the site.' }
+      responses:
+        '200': { description: HTML confirmation page., content: { text/html: { schema: { type: string } } } }
+  /webhooks/ses/{site_id}/{secret}:
+    parameters:
+      - { name: site_id, in: path, required: true, schema: { type: integer } }
+      - { name: secret, in: path, required: true, schema: { type: string }, description: The site's `webhook_secret`. }
+    post:
+      tags: [Public]
+      operationId: sesWebhook
+      summary: Amazon SNS endpoint for SES bounces and complaints
+      description: Point an SNS HTTPS subscription here (the site's `webhook_url`). Subscription confirmations are handled automatically.
+      security: []
+      requestBody:
+        content:
+          text/plain: { schema: { type: string, description: SNS JSON message. } }
+          application/json: { schema: { type: object } }
+      responses:
+        '200': { description: Processed. }
+        '404': { description: Unknown site or wrong secret. }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: lc_…
+      description: An API key created under **Account → API keys**.
+    session:
+      type: apiKey
+      in: cookie
+      name: lc_session
+      description: Browser session set by the sign-in endpoints.
+
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: integer } }
+    SiteId: { name: id, in: path, required: true, schema: { type: integer }, description: Site ID. }
+    ListId: { name: id, in: path, required: true, schema: { type: integer }, description: List ID. }
+    Token: { name: token, in: path, required: true, schema: { type: string }, description: Subscription token from the email link. }
+
+  responses:
+    Ok:
+      description: Success.
+      content: { application/json: { schema: { type: object, properties: { ok: { type: boolean, const: true } } } } }
+    Error:
+      description: The request was rejected; see `error`.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthorized:
+      description: Missing or invalid API key / session.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' }, example: { error: unauthorized } } }
+    SessionRequired:
+      description: Called with an API key; this action requires a browser session.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Doesn't exist or belongs to another account.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' }, example: { error: not found } } }
+    User:
+      description: The signed-in user.
+      content: { application/json: { schema: { $ref: '#/components/schemas/User' } } }
+    Site:
+      description: The site.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Site' } } }
+    ListWithSite:
+      description: The list, including its site.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/List'
+              - type: object
+                properties:
+                  site: { $ref: '#/components/schemas/Site' }
+    Campaign:
+      description: The campaign with delivery stats.
+      content: { application/json: { schema: { $ref: '#/components/schemas/CampaignWithStats' } } }
+    WebAuthnChallenge:
+      description: Ceremony ID and WebAuthn options (base64url fields).
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              challenge_id: { type: string, description: Pass back to the matching finish endpoint within 5 minutes. }
+              options: { type: object }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, example: name and domain are required }
+    Credentials:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 10 }
+        account_name: { type: string, description: Setup only. }
+    EmailAddress:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email, example: you@example.com }
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        account_id: { type: integer }
+        email: { type: string, format: email }
+    ApiKey:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        prefix: { type: string, example: lc_k3Yb9Q, description: First characters of the token, for identification. }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: [string, 'null'], format: date-time }
+        expires_at: { type: [string, 'null'], format: date-time }
+    Passkey:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: [string, 'null'], format: date-time }
+    ProviderKind:
+      type: string
+      enum: [ses, smtp, log]
+      description: '`log` only writes emails to the server log (for testing).'
+    SiteInput:
+      type: object
+      required: [name, domain, from_name, from_email]
+      properties:
+        name: { type: string, example: My Blog }
+        domain: { type: string, example: example.com, description: The website's domain (used in List-Id and the signup form instructions). }
+        from_name: { type: string, example: My Blog }
+        from_email: { type: string, format: email, example: hello@news.example.com, description: Use a subdomain verified with your provider. }
+        reply_to: { type: string, format: email, description: Optional. }
+        physical_address: { type: string, example: '123 Main St, Springfield, UT 84000, USA', description: Required before sending (CAN-SPAM). Shown in every footer. }
+        provider_kind: { $ref: '#/components/schemas/ProviderKind' }
+        provider_config:
+          anyOf:
+            - $ref: '#/components/schemas/SesConfig'
+            - $ref: '#/components/schemas/SmtpConfig'
+            - { type: object, description: Empty for `log`. }
+        send_rate: { type: integer, minimum: 1, maximum: 500, default: 10, description: Max emails per second for this site. }
+    SesConfig:
+      type: object
+      title: Amazon SES
+      required: [region]
+      properties:
+        region: { type: string, example: us-east-1 }
+        access_key_id: { type: string, description: Blank to use the AWS_ACCESS_KEY_ID environment variable. }
+        secret_access_key: { type: string, writeOnly: true, description: Returned masked as `********`. }
+        configuration_set: { type: string }
+    SmtpConfig:
+      type: object
+      title: SMTP
+      required: [host]
+      properties:
+        host: { type: string, example: smtp.postmarkapp.com }
+        port: { type: integer, example: 587 }
+        security: { type: string, enum: [starttls, tls, none], default: starttls }
+        username: { type: string }
+        password: { type: string, writeOnly: true, description: Returned masked as `********`. }
+    Site:
+      type: object
+      properties:
+        id: { type: integer }
+        account_id: { type: integer }
+        name: { type: string }
+        domain: { type: string }
+        from_name: { type: string }
+        from_email: { type: string }
+        reply_to: { type: string }
+        physical_address: { type: string }
+        provider_kind: { $ref: '#/components/schemas/ProviderKind' }
+        provider_config: { type: object, description: Provider settings with secrets masked. }
+        send_rate: { type: integer }
+        webhook_secret: { type: string }
+        webhook_url: { type: string, format: uri, description: Amazon SNS endpoint for bounces and complaints. }
+        icon_url: { type: [string, 'null'], description: Relative URL of the site's favicon, or null when it has none. }
+        created_at: { type: string, format: date-time }
+    ListInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, example: Weekly Digest }
+        description: { type: string }
+        double_opt_in: { type: boolean, default: true, description: Require email confirmation (strongly recommended). }
+        redirect_url: { type: string, format: uri, description: Where HTML form signups are redirected. Blank for the built-in page. }
+    List:
+      type: object
+      properties:
+        id: { type: integer }
+        site_id: { type: integer }
+        public_id: { type: string, description: Used in the public signup URL. }
+        name: { type: string }
+        description: { type: string }
+        double_opt_in: { type: integer, enum: [0, 1] }
+        redirect_url: { type: string }
+        subscribe_url: { type: string, format: uri, description: Public signup endpoint for forms. }
+        created_at: { type: string, format: date-time }
+    SubscriptionStatus:
+      type: string
+      enum: [pending, confirmed, unsubscribed]
+    Subscription:
+      type: object
+      properties:
+        id: { type: integer, description: 'Subscription ID (use with /api/subscriptions/{id}).' }
+        email: { type: string }
+        name: { type: string }
+        status: { $ref: '#/components/schemas/SubscriptionStatus' }
+        subscriber_status: { type: string, enum: [active, bounced, complained, suppressed], description: Site-wide status; only `active` receives email. }
+        source: { type: string, enum: [form, admin, import] }
+        created_at: { type: string, format: date-time }
+        confirmed_at: { type: [string, 'null'], format: date-time }
+        unsubscribed_at: { type: [string, 'null'], format: date-time }
+    CampaignInput:
+      type: object
+      required: [subject]
+      properties:
+        subject: { type: string, example: 'The porch is finished!' }
+        preheader: { type: string, description: Inbox preview text. }
+        html_body:
+          type: string
+          example: '<h1>Hello {{name}}!</h1><p>News from the farmhouse.</p>'
+          description: |
+            HTML content. Placeholders: `{{name}}`, `{{email}}`, `{{list_name}}`, `{{site_name}}`,
+            `{{unsubscribe_url}}`. Values are HTML-escaped. Wrapped in a responsive layout with the
+            compliance footer.
+        text_body: { type: string, description: Plain-text alternative. Generated from the HTML when blank. }
+    Campaign:
+      type: object
+      properties:
+        id: { type: integer }
+        list_id: { type: integer }
+        subject: { type: string }
+        preheader: { type: string }
+        html_body: { type: string }
+        text_body: { type: string }
+        status: { type: string, enum: [draft, sending, paused, sent] }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+    CampaignWithStats:
+      allOf:
+        - $ref: '#/components/schemas/Campaign'
+        - type: object
+          properties:
+            stats:
+              type: object
+              properties:
+                total: { type: integer, description: Recipients queued. }
+                sent: { type: integer }
+                failed: { type: integer }
+                skipped: { type: integer, description: Unsubscribed or suppressed before their turn. }
+    EmailEvent:
+      type: object
+      properties:
+        id: { type: integer }
+        email: { type: string }
+        kind: { type: string, enum: [bounce, complaint] }
+        detail: { type: string }
+        created_at: { type: string, format: date-time }
+    SubscribeForm:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email }
+        name: { type: string, maxLength: 100 }
+        website: { type: string, description: Honeypot — must be empty. }

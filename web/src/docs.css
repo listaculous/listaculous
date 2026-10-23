@@ -1,0 +1,109 @@
+/* Scalar themed with the Listaculous design tokens (see app.css). Scalar puts .light-mode /
+   .dark-mode on <body>; we map its variables onto ours so both themes match the app. */
+body { margin: 0; background: var(--bg); font-family: var(--font); -webkit-font-smoothing: antialiased; }
+#docs-header a { text-decoration: none; }
+#docs-header .brand { display: flex; align-items: center; gap: 10px; color: var(--text); font-weight: 800; letter-spacing: -.02em; }
+#docs-header .spacer { flex: 1; }
+/* ---------- Theme switcher (radio group) ---------- */
+#docs-header .theme-switch { display: grid; grid-template-columns: repeat(3, 1fr); background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 10px; padding: 3px; gap: 2px; }
+#docs-header .theme-switch label { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 4px; border-radius: 7px; cursor: pointer; color: var(--muted); font-size: 12.5px; font-weight: 550; transition: background .15s, color .15s; }
+#docs-header .theme-switch label:hover { color: var(--text); }
+#docs-header .theme-switch input { position: absolute; opacity: 0; pointer-events: none; }
+#docs-header .theme-switch label:has(input:checked) { background: var(--bg-elev); color: var(--text); box-shadow: var(--shadow); }
+#docs-header .theme-switch label:has(input:focus-visible) { box-shadow: 0 0 0 2px var(--ring); }
+
+
+
+.light-mode,
+.dark-mode {
+  --scalar-font: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --scalar-font-code: ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, monospace;
+  --scalar-radius: 8px;
+  --scalar-radius-lg: 12px;
+  --scalar-radius-xl: 14px;
+  --scalar-custom-header-height: 58px;
+  --scalar-heading-1: 30px;
+}
+
+.light-mode {
+  --scalar-background-1: #ffffff;
+  --scalar-background-2: #f6f7fb;
+  --scalar-background-3: #eef0f6;
+  --scalar-background-accent: #eef2ff;
+  --scalar-color-1: #111827;
+  --scalar-color-2: #4b5563;
+  --scalar-color-3: #6b7280;
+  --scalar-color-accent: #4f46e5;
+  --scalar-border-color: #e5e7ef;
+  --scalar-button-1: #4f46e5;
+  --scalar-button-1-hover: #4338ca;
+  --scalar-button-1-color: #ffffff;
+  --scalar-color-green: #059669;
+  --scalar-color-blue: #4f46e5;
+  --scalar-color-orange: #d97706;
+  --scalar-color-yellow: #b45309;
+  --scalar-color-red: #dc2626;
+  --scalar-color-purple: #7c3aed;
+  --scalar-link-color: #4f46e5;
+  --scalar-sidebar-background-1: #ffffff;
+  --scalar-sidebar-color-1: #111827;
+  --scalar-sidebar-color-2: #4b5563;
+  --scalar-sidebar-border-color: #e5e7ef;
+  --scalar-sidebar-item-hover-background: #eef0f6;
+  --scalar-sidebar-item-hover-color: #111827;
+  --scalar-sidebar-item-active-background: #eef2ff;
+  --scalar-sidebar-color-active: #4f46e5;
+  --scalar-sidebar-search-background: #f6f7fb;
+  --scalar-sidebar-search-border-color: #e5e7ef;
+  --scalar-sidebar-search-color: #6b7280;
+}
+
+.dark-mode {
+  --scalar-background-1: #0b0d14;
+  --scalar-background-2: #131622;
+  --scalar-background-3: #1a1e2d;
+  --scalar-background-accent: rgba(129, 140, 248, 0.12);
+  --scalar-color-1: #eef0f7;
+  --scalar-color-2: #b8bdd0;
+  --scalar-color-3: #8a90a6;
+  --scalar-color-accent: #818cf8;
+  --scalar-border-color: #232838;
+  --scalar-button-1: #818cf8;
+  --scalar-button-1-hover: #a5b4fc;
+  --scalar-button-1-color: #0b0d14;
+  --scalar-color-green: #34d399;
+  --scalar-color-blue: #818cf8;
+  --scalar-color-orange: #fbbf24;
+  --scalar-color-yellow: #fbbf24;
+  --scalar-color-red: #f87171;
+  --scalar-color-purple: #a78bfa;
+  --scalar-link-color: #818cf8;
+  --scalar-sidebar-background-1: #0f121c;
+  --scalar-sidebar-color-1: #eef0f7;
+  --scalar-sidebar-color-2: #b8bdd0;
+  --scalar-sidebar-border-color: #232838;
+  --scalar-sidebar-item-hover-background: #131622;
+  --scalar-sidebar-item-hover-color: #eef0f7;
+  --scalar-sidebar-item-active-background: rgba(129, 140, 248, 0.12);
+  --scalar-sidebar-color-active: #818cf8;
+  --scalar-sidebar-search-background: #131622;
+  --scalar-sidebar-search-border-color: #232838;
+  --scalar-sidebar-search-color: #8a90a6;
+}
+
+/* Brand bar above Scalar (its sticky sidebar offsets by --scalar-custom-header-height). */
+#docs-header { position: sticky; top: 0; z-index: 100; }
+.docs-bar {
+  height: 58px; display: flex; align-items: center; gap: 14px; padding: 0 20px;
+  background: var(--sidebar); border-bottom: 1px solid var(--border);
+}
+.docs-bar .brand { padding: 0; font-size: 17px; }
+.docs-bar .brand img { width: 30px; height: 30px; }
+.docs-tag { font-size: 11px; font-weight: 700; letter-spacing: .06em; color: #fff; background: var(--gradient); padding: 2px 7px; border-radius: 6px; }
+.docs-link { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); font-weight: 550; font-size: 14px; }
+.docs-link:hover { color: var(--text); }
+.docs-theme { width: 230px; }
+@media (max-width: 720px) {
+  .docs-link span, .docs-theme .theme-switch span { display: none; }
+  .docs-theme { width: 120px; }
+}

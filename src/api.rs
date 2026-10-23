@@ -54,6 +54,16 @@ fn site_json(s: &Site, base_url: &str) -> Value {
     let mut v = serde_json::to_value(s).unwrap();
     v["provider_config"] = s.masked_provider_config();
     v["webhook_url"] = format!("{base_url}/webhooks/ses/{}/{}", s.id, s.webhook_secret).into();
+    // Relative, cache-busted by the fetch time so a refreshed icon shows immediately.
+    v["icon_url"] = match &s.icon_type {
+        Some(_) => format!(
+            "/api/sites/{}/icon?v={}",
+            s.id,
+            s.icon_checked_at.as_deref().unwrap_or("")
+        )
+        .into(),
+        None => Value::Null,
+    };
     v
 }
 
@@ -218,7 +228,26 @@ pub async fn create_site(
     .bind(now())
     .fetch_one(&st.db)
     .await?;
+    crate::favicon::refresh_soon(&st, id, i.domain.clone()).await;
     get_site(State(st), u, Path(id)).await
+}
+
+/// Updates a site. The CASEs compare against the row's *current* domain inside the statement, so a
+/// domain change atomically drops the old icon and marks it unchecked, whatever other saves race it.
+pub(crate) const UPDATE_SITE_SQL: &str =
+    "UPDATE sites SET name=$1, domain=$2, from_name=$3, from_email=$4, reply_to=$5, \
+     physical_address=$6, provider_kind=$7, provider_config=$8, send_rate=$9, \
+     icon_data = CASE WHEN domain = $2 THEN icon_data ELSE NULL END, \
+     icon_type = CASE WHEN domain = $2 THEN icon_type ELSE NULL END, \
+     icon_checked_at = CASE WHEN domain = $2 THEN icon_checked_at ELSE NULL END WHERE id=$10";
+
+pub(crate) async fn site_needs_icon(db: &crate::db::Db, id: i64) -> AppResult<bool> {
+    let (checked,): (Option<String>,) =
+        sqlx::query_as("SELECT icon_checked_at FROM sites WHERE id = $1")
+            .bind(id)
+            .fetch_one(db)
+            .await?;
+    Ok(checked.is_none())
 }
 
 pub async fn update_site(
@@ -230,22 +259,28 @@ pub async fn update_site(
     let existing = site_for(&st, &u, id).await?;
     i.validate()?;
     i.merge_secrets(&existing.provider_config);
-    sqlx::query(
-        "UPDATE sites SET name=$1, domain=$2, from_name=$3, from_email=$4, reply_to=$5, physical_address=$6, \
-         provider_kind=$7, provider_config=$8, send_rate=$9 WHERE id=$10",
-    )
-    .bind(&i.name)
-    .bind(&i.domain)
-    .bind(&i.from_name)
-    .bind(&i.from_email)
-    .bind(&i.reply_to)
-    .bind(&i.physical_address)
-    .bind(&i.provider_kind)
-    .bind(i.provider_config.to_string())
-    .bind(i.send_rate)
-    .bind(id)
-    .execute(&st.db)
-    .await?;
+    sqlx::query(UPDATE_SITE_SQL)
+        .bind(&i.name)
+        .bind(&i.domain)
+        .bind(&i.from_name)
+        .bind(&i.from_email)
+        .bind(&i.reply_to)
+        .bind(&i.physical_address)
+        .bind(&i.provider_kind)
+        .bind(i.provider_config.to_string())
+        .bind(i.send_rate)
+        .bind(id)
+        .execute(&st.db)
+        .await?;
+    // Decide from the row as written (not our earlier read, which a concurrent save may have
+    // made stale): an unchecked icon means the domain changed and the icon needs fetching.
+    if site_needs_icon(&st.db, id).await? {
+        let (domain,): (String,) = sqlx::query_as("SELECT domain FROM sites WHERE id = $1")
+            .bind(id)
+            .fetch_one(&st.db)
+            .await?;
+        crate::favicon::refresh_soon(&st, id, domain).await;
+    }
     get_site(State(st), u, Path(id)).await
 }
 
@@ -925,4 +960,70 @@ pub async fn pause_campaign(State(st): State<AppState>, u: AuthUser, Path(id): P
         .execute(&st.db)
         .await?;
     get_campaign(State(st), u, Path(id)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn update(db: &crate::db::Db, domain: &str) {
+        sqlx::query(UPDATE_SITE_SQL)
+            .bind("Site")
+            .bind(domain)
+            .bind("F")
+            .bind("f@example.com")
+            .bind("")
+            .bind("1 St")
+            .bind("log")
+            .bind("{}")
+            .bind(10_i64)
+            .bind(1_i64)
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    /// Regression: request A read domain a.example; B changed it to b.example; then A saved its
+    /// stale a.example. The icon must be cleared *and* flagged for fetching, not silently lost.
+    #[tokio::test]
+    async fn domain_change_flags_icon_even_with_stale_concurrent_save() {
+        let path = std::env::temp_dir().join(format!("lc-test-{}.db", crate::db::random_token(8)));
+        let db = crate::db::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO accounts (name, created_at) VALUES ('a', 'now')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sites (account_id, name, domain, from_name, from_email, webhook_secret, created_at, icon_data, icon_type, icon_checked_at) \
+             VALUES (1, 'Site', 'a.example', 'F', 'f@example.com', 's', 'now', $1, 'image/png', 't0')",
+        )
+        .bind(vec![1u8, 2, 3])
+        .execute(&db).await.unwrap();
+
+        update(&db, "a.example").await; // unrelated save: icon kept
+        assert!(!site_needs_icon(&db, 1).await.unwrap());
+
+        update(&db, "b.example").await; // B: domain change
+        assert!(site_needs_icon(&db, 1).await.unwrap());
+        sqlx::query(
+            "UPDATE sites SET icon_type = 'image/png', icon_checked_at = 't1' WHERE id = 1",
+        )
+        .execute(&db)
+        .await
+        .unwrap(); // B's fetch done
+
+        update(&db, "a.example").await; // A: stale save restores the old domain
+        assert!(
+            site_needs_icon(&db, 1).await.unwrap(),
+            "icon for restored domain must be re-fetched"
+        );
+        let (t,): (Option<String>,) = sqlx::query_as("SELECT icon_type FROM sites WHERE id = 1")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert!(t.is_none(), "b.example's icon must not remain on a.example");
+        let _ = std::fs::remove_file(path);
+    }
 }

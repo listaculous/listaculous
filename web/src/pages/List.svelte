@@ -166,7 +166,7 @@ const { message, error } = await res.json();` : '');
   {#if tab === 'subscribers'}
     <div class="card flush">
       <div class="toolbar">
-        <div class="input-icon"><Search size={16} /><input placeholder="Search email or name" bind:value={q} oninput={() => { page = 0; loadSubs(); }} /></div>
+        <div class="input-icon"><Search size={16} /><input autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" placeholder="Search email or name" bind:value={q} oninput={() => { page = 0; loadSubs(); }} /></div>
         <select bind:value={status} onchange={() => { page = 0; loadSubs(); }}>
           <option value="">All statuses</option>
           <option value="confirmed">Confirmed</option>
@@ -221,8 +221,8 @@ const { message, error } = await res.json();` : '');
       <div class="card">
         <div class="card-head"><div><h2>Add subscriber</h2><p class="muted small">Added as confirmed — only add people who gave you permission.</p></div></div>
         <form onsubmit={add}>
-          <label class="field">Email <input type="email" bind:value={addEmail} required placeholder="jane@example.com" /></label>
-          <label class="field">Name <span class="muted">(optional)</span> <input bind:value={addName} placeholder="Jane" /></label>
+          <label class="field">Email <input type="email" bind:value={addEmail} required placeholder="jane@example.com" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
+          <label class="field">Name <span class="muted">(optional)</span> <input bind:value={addName} placeholder="Jane" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
           <button><UserPlus size={16} /> Add subscriber</button>
         </form>
       </div>
@@ -279,18 +279,18 @@ const { message, error } = await res.json();` : '');
     <div class="card">
       <div class="card-head"><div><h2>Live preview</h2><p class="muted small">This form really subscribes — use your own address to try the flow.</p></div></div>
       <form action={list.subscribe_url} method="post" target="_blank" class="actions" style="max-width:560px;flex-wrap:nowrap">
-        <input type="email" name="email" placeholder="you@example.com" required />
-        <input type="text" name="website" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px" aria-hidden="true" />
+        <input type="email" name="email" placeholder="you@example.com" required autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" />
+        <input type="text" name="website" tabindex="-1" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" style="position:absolute;left:-9999px" aria-hidden="true" />
         <button><ExternalLink size={15} /> Subscribe</button>
       </form>
     </div>
   {:else if tab === 'settings' && edit}
     <div class="card" style="max-width:760px">
       <form onsubmit={saveList}>
-        <label class="field">Name <input bind:value={edit.name} required /></label>
-        <label class="field">Description <input bind:value={edit.description} /></label>
+        <label class="field">Name <input bind:value={edit.name} required autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
+        <label class="field">Description <input bind:value={edit.description} autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
         <label class="field">Redirect after signup <span class="muted">(optional)</span>
-          <input type="url" bind:value={edit.redirect_url} placeholder="https://{list.site.domain}/thanks" />
+          <input type="url" bind:value={edit.redirect_url} placeholder="https://{list.site.domain}/thanks" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" />
           <span class="hint">Where plain HTML form submissions land. Leave blank for the built-in thank-you page.</span></label>
         <label class="check"><input type="checkbox" bind:checked={edit.double_opt_in} />
           <span>Require email confirmation (double opt-in)<span class="hint">Strongly recommended for deliverability and consent records.</span></span></label>

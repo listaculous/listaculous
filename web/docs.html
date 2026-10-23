@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>API Reference · Listaculous</title>
+    <link rel="icon" type="image/png" href="/brand/favicon.png" />
+    <script>
+      // Same pre-paint theme logic as the app (shared localStorage key), so there's no flash.
+      (function () {
+        var m = 'system';
+        try { m = localStorage.getItem('lc-theme') || 'system'; } catch (e) {}
+        var dark = m === 'dark' || (m !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      })();
+    </script>
+  </head>
+  <body>
+    <header id="docs-header"></header>
+    <div id="api-reference"></div>
+    <script type="module" src="/src/docs.js"></script>
+  </body>
+</html>

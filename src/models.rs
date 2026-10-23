@@ -16,11 +16,17 @@ pub struct Site {
     pub send_rate: i64,
     pub webhook_secret: String,
     pub created_at: String,
+    /// MIME type of the stored favicon; None when the site has no icon.
+    #[serde(skip)]
+    pub icon_type: Option<String>,
+    /// Last favicon fetch attempt; also used to cache-bust the icon URL.
+    #[serde(skip)]
+    pub icon_checked_at: Option<String>,
 }
 
 pub const SITE_COLS: &str =
     "id, account_id, name, domain, from_name, from_email, reply_to, physical_address, \
-    provider_kind, provider_config, send_rate, webhook_secret, created_at";
+    provider_kind, provider_config, send_rate, webhook_secret, created_at, icon_type, icon_checked_at";
 
 /// Keys inside provider_config that are secrets and never returned to the browser.
 pub const SECRET_KEYS: &[&str] = &["secret_access_key", "password"];

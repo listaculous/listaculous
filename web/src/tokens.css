@@ -1,0 +1,57 @@
+/* Design tokens shared by the admin app and the API docs page. */
+:root {
+  --font: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, monospace;
+  --radius: 12px;
+  --radius-sm: 8px;
+
+  --brand: #4f46e5;
+  --brand-2: #7c3aed;
+  --amber: #f59e0b;
+  --gradient: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+
+  --bg: #f6f7fb;
+  --bg-elev: #ffffff;
+  --bg-sunken: #eef0f6;
+  --sidebar: #ffffff;
+  --text: #111827;
+  --text-2: #4b5563;
+  --muted: #6b7280;
+  --border: #e5e7ef;
+  --border-strong: #d4d7e3;
+  --ring: rgba(79, 70, 229, .35);
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-soft: #eef2ff;
+  --accent-text: #ffffff;
+  --ok: #059669;  --ok-soft: #ecfdf5;
+  --warn: #b45309; --warn-soft: #fffbeb;
+  --danger: #dc2626; --danger-soft: #fef2f2;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 1px 3px rgba(16, 24, 40, .06);
+  --shadow-lg: 0 12px 32px -8px rgba(30, 27, 75, .18);
+  color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  --bg: #0b0d14;
+  --bg-elev: #131622;
+  --bg-sunken: #0f121c;
+  --sidebar: #0f121c;
+  --text: #eef0f7;
+  --text-2: #b8bdd0;
+  --muted: #8a90a6;
+  --border: #232838;
+  --border-strong: #2f3549;
+  --ring: rgba(129, 140, 248, .45);
+  --accent: #818cf8;
+  --accent-hover: #a5b4fc;
+  --accent-soft: rgba(129, 140, 248, .12);
+  --accent-text: #0b0d14;
+  --ok: #34d399;  --ok-soft: rgba(52, 211, 153, .12);
+  --warn: #fbbf24; --warn-soft: rgba(251, 191, 36, .12);
+  --danger: #f87171; --danger-soft: rgba(248, 113, 113, .12);
+  --shadow: 0 1px 2px rgba(0, 0, 0, .4);
+  --shadow-lg: 0 16px 40px -12px rgba(0, 0, 0, .6);
+  color-scheme: dark;
+}
+

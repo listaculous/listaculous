@@ -1,9 +1,9 @@
 <script>
   import LayoutDashboard from '@lucide/svelte/icons/layout-dashboard';
-  import Globe from '@lucide/svelte/icons/globe';
   import Mail from '@lucide/svelte/icons/mail';
   import UserRound from '@lucide/svelte/icons/user-round';
   import LogOut from '@lucide/svelte/icons/log-out';
+  import BookOpen from '@lucide/svelte/icons/book-open';
   import Menu from '@lucide/svelte/icons/menu';
   import Plus from '@lucide/svelte/icons/plus';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
@@ -12,6 +12,7 @@
   import { nav, refreshNav } from './stores.svelte.js';
   import './theme.svelte.js';
   import ThemeSwitch from './components/ThemeSwitch.svelte';
+  import SiteIcon from './components/SiteIcon.svelte';
   import Login from './pages/Login.svelte';
   import Dashboard from './pages/Dashboard.svelte';
   import Site from './pages/Site.svelte';
@@ -73,11 +74,12 @@
 
       <a class="nav-link" class:active={isActive('/')} href="#/"><LayoutDashboard size={17} /> Dashboard</a>
       <a class="nav-link" class:active={isActive('/account')} href="#/account"><UserRound size={17} /> Account</a>
+      <a class="nav-link" href="/docs" target="_blank" rel="noopener"><BookOpen size={17} /> API docs</a>
 
       <div class="nav-label">Sites</div>
       {#each nav.sites as s (s.id)}
         <a class="nav-link" class:active={isActive(`/sites/${s.id}`)} href="#/sites/{s.id}" title={s.domain}>
-          <Globe size={17} /> <span class="label">{s.name}</span>
+          <SiteIcon site={s} size={20} radius={5} /> <span class="label">{s.name}</span>
         </a>
         {#each nav.lists.filter((l) => l.site_id === s.id) as l (l.id)}
           <a class="nav-link" style="padding-left:34px" class:active={isActive(`/lists/${l.id}`)} href="#/lists/{l.id}" title={l.name}>

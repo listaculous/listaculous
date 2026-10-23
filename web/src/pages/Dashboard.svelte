@@ -7,7 +7,7 @@
   import Send from '@lucide/svelte/icons/send';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import { api, fmtDate } from '../api.js';
-  import { initials } from '../stores.svelte.js';
+  import SiteIcon from '../components/SiteIcon.svelte';
   import Empty from '../components/Empty.svelte';
 
   let sites = $state([]);
@@ -56,7 +56,7 @@
       {@const lists = dash.lists.filter((l) => l.site_id === s.id)}
       <a class="card site-card" href="#/sites/{s.id}">
         <div class="top">
-          <div class="site-icon">{initials(s.name)}</div>
+          <SiteIcon site={s} />
           <div style="min-width:0">
             <h3>{s.name}</h3>
             <div class="small muted">{s.domain}</div>

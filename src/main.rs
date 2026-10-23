@@ -1,10 +1,13 @@
 mod api;
+mod api_keys;
 mod auth;
 mod db;
 mod error;
+mod favicon;
 mod mailer;
-mod passkeys;
 mod models;
+mod openapi;
+mod passkeys;
 mod public;
 mod worker;
 
@@ -52,6 +55,7 @@ pub struct AppState {
     pub limiter: Arc<RateLimiter>,
     pub auth_limiter: Arc<RateLimiter>,
     pub webauthn: Arc<webauthn_rs::Webauthn>,
+    pub openapi: Arc<serde_json::Value>,
 }
 
 /// Fixed-window per-key rate limiter for public endpoints.
@@ -106,21 +110,36 @@ async fn main() -> anyhow::Result<()> {
         limiter: Arc::new(RateLimiter::new(20, Duration::from_secs(60))),
         auth_limiter: Arc::new(RateLimiter::new(10, Duration::from_secs(300))),
         webauthn: Arc::new(passkeys::build(&cfg.base_url)?),
+        openapi: Arc::new(openapi::load(&cfg.base_url)?),
     };
 
     tokio::spawn(worker::run(state.clone()));
+    tokio::spawn(favicon::backfill(state.clone()));
 
     let admin = Router::new()
+        .route("/openapi.json", get(openapi::json))
+        .route("/openapi.yaml", get(openapi::yaml))
         .route("/auth/status", get(auth::status))
         .route("/auth/setup", post(auth::setup))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
         .route("/auth/password", post(auth::change_password))
+        .route("/auth/api-keys", get(api_keys::list).post(api_keys::create))
+        .route("/auth/api-keys/{id}", delete(api_keys::revoke))
         .route("/auth/passkeys", get(passkeys::list))
-        .route("/auth/passkeys/{id}", axum::routing::put(passkeys::rename).delete(passkeys::remove))
-        .route("/auth/passkey/register/start", post(passkeys::register_start))
-        .route("/auth/passkey/register/finish", post(passkeys::register_finish))
+        .route(
+            "/auth/passkeys/{id}",
+            axum::routing::put(passkeys::rename).delete(passkeys::remove),
+        )
+        .route(
+            "/auth/passkey/register/start",
+            post(passkeys::register_start),
+        )
+        .route(
+            "/auth/passkey/register/finish",
+            post(passkeys::register_finish),
+        )
         .route("/auth/passkey/login/start", post(passkeys::login_start))
         .route("/auth/passkey/login/finish", post(passkeys::login_finish))
         .route("/dashboard", get(api::dashboard))
@@ -132,6 +151,8 @@ async fn main() -> anyhow::Result<()> {
                 .delete(api::delete_site),
         )
         .route("/sites/{id}/test", post(api::test_site))
+        .route("/sites/{id}/icon", get(favicon::get_icon))
+        .route("/sites/{id}/icon/refresh", post(favicon::refresh_icon))
         .route(
             "/sites/{id}/lists",
             get(api::list_lists).post(api::create_list),
@@ -188,6 +209,10 @@ async fn main() -> anyhow::Result<()> {
             post(public::ses_webhook),
         )
         .route("/healthz", get(|| async { "ok" }))
+        .route_service(
+            "/docs",
+            ServeFile::new(format!("{}/docs.html", cfg.static_dir)),
+        )
         .fallback_service(ServeDir::new(&cfg.static_dir).fallback(ServeFile::new(index)))
         .layer(axum::middleware::from_fn(cache_headers))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(

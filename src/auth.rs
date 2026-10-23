@@ -23,6 +23,32 @@ pub struct AuthUser {
     pub id: i64,
     pub account_id: i64,
     pub email: String,
+    /// True when authenticated with an API key rather than a browser session.
+    #[serde(skip)]
+    pub via_api_key: bool,
+}
+
+impl AuthUser {
+    pub fn new(id: i64, account_id: i64, email: String) -> Self {
+        Self {
+            id,
+            account_id,
+            email,
+            via_api_key: false,
+        }
+    }
+
+    /// Credential management (password, passkeys, API keys) requires a real browser session, so a
+    /// leaked API key can't be used to mint more keys or lock the owner out.
+    pub fn require_session(&self) -> AppResult<()> {
+        if self.via_api_key {
+            return Err(AppError::new(
+                StatusCode::FORBIDDEN,
+                "this action requires signing in to the web app; API keys can't manage credentials",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl FromRequestParts<AppState> for AuthUser {
@@ -32,6 +58,18 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // API key: `Authorization: Bearer lc_…` (for scripts and AI agents).
+        if let Some(key) = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| {
+                v.strip_prefix("Bearer ")
+                    .or_else(|| v.strip_prefix("bearer "))
+            })
+        {
+            return crate::api_keys::authenticate(state, key.trim()).await;
+        }
         let jar = CookieJar::from_headers(&parts.headers);
         let token = jar
             .get(COOKIE)
@@ -46,11 +84,7 @@ impl FromRequestParts<AppState> for AuthUser {
         .fetch_optional(&state.db)
         .await?;
         let (id, account_id, email) = row.ok_or_else(AppError::unauthorized)?;
-        Ok(AuthUser {
-            id,
-            account_id,
-            email,
-        })
+        Ok(AuthUser::new(id, account_id, email))
     }
 }
 
@@ -139,14 +173,7 @@ pub async fn setup(
     .await?;
     tx.commit().await?;
     let jar = start_session(&st, jar, user_id, &hash, None).await?;
-    Ok((
-        jar,
-        Json(AuthUser {
-            id: user_id,
-            account_id,
-            email,
-        }),
-    ))
+    Ok((jar, Json(AuthUser::new(user_id, account_id, email))))
 }
 
 pub async fn login(
@@ -192,14 +219,7 @@ pub async fn login(
                 e
             }
         })?;
-    Ok((
-        jar,
-        Json(AuthUser {
-            id,
-            account_id,
-            email,
-        }),
-    ))
+    Ok((jar, Json(AuthUser::new(id, account_id, email))))
 }
 
 pub async fn logout(State(st): State<AppState>, jar: CookieJar) -> AppResult<CookieJar> {
@@ -228,6 +248,7 @@ pub async fn change_password(
     jar: CookieJar,
     Json(p): Json<PasswordChange>,
 ) -> AppResult<(CookieJar, Json<serde_json::Value>)> {
+    user.require_session()?;
     if !st.auth_limiter.check(&format!("user:{}", user.id)) {
         return Err(AppError::new(
             StatusCode::TOO_MANY_REQUESTS,

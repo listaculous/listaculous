@@ -46,16 +46,16 @@
 <form onsubmit={submit}>
   <div class="section-title">Website</div>
   <div class="grid-2">
-    <label class="field">Site name <input bind:value={f.name} required placeholder="My Blog" /></label>
-    <label class="field">Website domain <input bind:value={f.domain} required placeholder="example.com" /></label>
+    <label class="field">Site name <input bind:value={f.name} required placeholder="My Blog" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
+    <label class="field">Website domain <input bind:value={f.domain} required placeholder="example.com" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
   </div>
 
   <div class="section-title">Sender</div>
   <div class="grid-2">
-    <label class="field">From name <input bind:value={f.from_name} required placeholder="My Blog" /></label>
-    <label class="field">From email <input type="email" bind:value={f.from_email} required placeholder="hello@news.example.com" /></label>
-    <label class="field">Reply-to <span class="muted">(optional)</span> <input type="email" bind:value={f.reply_to} placeholder="you@example.com" /></label>
-    <label class="field">Send rate <span class="muted">(emails / second)</span> <input type="number" min="1" max="500" bind:value={f.send_rate} />
+    <label class="field">From name <input bind:value={f.from_name} required placeholder="My Blog" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
+    <label class="field">From email <input type="email" bind:value={f.from_email} required placeholder="hello@news.example.com" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
+    <label class="field">Reply-to <span class="muted">(optional)</span> <input type="email" bind:value={f.reply_to} placeholder="you@example.com" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
+    <label class="field">Send rate <span class="muted">(emails / second)</span> <input type="number" min="1" max="500" bind:value={f.send_rate} autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" />
       <span class="hint">Match your provider's limit. SES starts at 1/s in the sandbox, often 14/s+ in production.</span>
     </label>
   </div>
@@ -81,17 +81,17 @@
 
   {#if f.provider_kind === 'ses'}
     <div class="grid-2">
-      <label class="field">AWS region <input bind:value={f.provider_config.region} placeholder="us-east-1" required /></label>
-      <label class="field">Configuration set <span class="muted">(optional)</span> <input bind:value={f.provider_config.configuration_set} /></label>
-      <label class="field">Access key ID <input bind:value={f.provider_config.access_key_id} placeholder="Leave blank to use AWS_* env vars" autocomplete="off" /></label>
+      <label class="field">AWS region <input bind:value={f.provider_config.region} placeholder="us-east-1" required autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
+      <label class="field">Configuration set <span class="muted">(optional)</span> <input bind:value={f.provider_config.configuration_set} autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
+      <label class="field">Access key ID <input bind:value={f.provider_config.access_key_id} placeholder="Leave blank to use AWS_* env vars" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
       <label class="field">Secret access key <input type="password" bind:value={f.provider_config.secret_access_key} placeholder="Leave blank to keep current / use env" autocomplete="new-password" /></label>
     </div>
     <p class="muted small" style="display:flex;gap:8px"><Lightbulb size={15} style="flex-shrink:0;margin-top:2px" />
       <span>The IAM user only needs <code>ses:SendRawEmail</code>. Verify your sending domain in SES and publish its DKIM, SPF and DMARC records.</span></p>
   {:else if f.provider_kind === 'smtp'}
     <div class="grid-2">
-      <label class="field">Host <input bind:value={f.provider_config.host} required placeholder="smtp.postmarkapp.com" /></label>
-      <label class="field">Port <input type="number" bind:value={f.provider_config.port} placeholder="587" /></label>
+      <label class="field">Host <input bind:value={f.provider_config.host} required placeholder="smtp.postmarkapp.com" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
+      <label class="field">Port <input type="number" bind:value={f.provider_config.port} placeholder="587" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
       <label class="field">Security
         <select bind:value={f.provider_config.security}>
           <option value="starttls">STARTTLS (587)</option>
@@ -99,7 +99,7 @@
           <option value="none">None (local relay only)</option>
         </select>
       </label>
-      <label class="field">Username <input bind:value={f.provider_config.username} autocomplete="off" /></label>
+      <label class="field">Username <input bind:value={f.provider_config.username} autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
       <label class="field">Password <input type="password" bind:value={f.provider_config.password} placeholder="Leave blank to keep current" autocomplete="new-password" /></label>
     </div>
   {:else}

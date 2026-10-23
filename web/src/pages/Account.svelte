@@ -7,6 +7,9 @@
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import Check from '@lucide/svelte/icons/check';
   import X from '@lucide/svelte/icons/x';
+  import Bot from '@lucide/svelte/icons/bot';
+  import BookOpen from '@lucide/svelte/icons/book-open';
+  import CodeBlock from '../components/CodeBlock.svelte';
   import { api, fmtDate } from '../api.js';
   import { passkeysSupported, registerPasskey, passkeyError } from '../webauthn.js';
   import Alert from '../components/Alert.svelte';
@@ -26,6 +29,45 @@
   let editing = $state(null);
   let editName = $state('');
   const supported = passkeysSupported();
+
+  let keys = $state([]);
+  let keyName = $state('');
+  let keyExpiry = $state('');
+  let newKey = $state(null);
+  let keyError = $state('');
+  let keyBusy = $state(false);
+
+  async function loadKeys() {
+    keys = await api('/auth/api-keys');
+  }
+  loadKeys();
+
+  async function createKey(e) {
+    e.preventDefault();
+    // A second concurrent request would replace the first one-time token before it's copied.
+    if (keyBusy) return;
+    keyBusy = true;
+    keyError = '';
+    try {
+      newKey = await api('/auth/api-keys', {
+        method: 'POST',
+        body: { name: keyName, expires_in_days: keyExpiry ? Number(keyExpiry) : null },
+      });
+      keyName = '';
+      loadKeys();
+    } catch (err) {
+      keyError = err.message;
+    } finally {
+      keyBusy = false;
+    }
+  }
+
+  async function revokeKey(k) {
+    if (!confirm(`Revoke "${k.name}"? Anything using it will stop working immediately.`)) return;
+    await api(`/auth/api-keys/${k.id}`, { method: 'DELETE' });
+    if (newKey?.id === k.id) newKey = null;
+    loadKeys();
+  }
 
   async function loadPasskeys() {
     passkeys = await api('/auth/passkeys');
@@ -138,6 +180,51 @@
     {:else}
       <Alert kind="warn">This browser doesn't support passkeys.</Alert>
     {/if}
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div><h2 style="display:flex;gap:8px;align-items:center"><Bot size={17} /> API keys</h2>
+        <p class="muted small">For scripts and AI agents. A key can do anything you can in the app, except manage passwords, passkeys and keys.</p></div>
+      <a class="btn secondary" href="/docs" target="_blank" rel="noopener"><BookOpen size={15} /> API docs</a>
+    </div>
+
+    {#if newKey}
+      <Alert kind="ok"><strong>{newKey.name}</strong> created. Copy the key now — it won't be shown again.</Alert>
+      <div style="margin-bottom:12px"><CodeBlock code={newKey.token} /></div>
+      <div style="margin-bottom:16px"><CodeBlock code={`curl -H "Authorization: Bearer ${newKey.token}" ${location.origin}/api/sites`} /></div>
+    {/if}
+    {#if keyError}<Alert kind="error">{keyError}</Alert>{/if}
+
+    {#if keys.length}
+      <div class="table-wrap" style="margin:0 -20px 16px;border-top:1px solid var(--border);border-bottom:1px solid var(--border)">
+        <table>
+          <thead><tr><th>Name</th><th>Key</th><th>Last used</th><th>Expires</th><th></th></tr></thead>
+          <tbody>
+            {#each keys as k (k.id)}
+              <tr>
+                <td class="cell-strong">{k.name}</td>
+                <td><code>{k.prefix}…</code></td>
+                <td class="small muted">{k.last_used_at ? fmtDate(k.last_used_at) : 'Never'}</td>
+                <td class="small muted">{k.expires_at ? fmtDate(k.expires_at) : 'Never'}</td>
+                <td class="actions-cell"><button class="link danger-text" onclick={() => revokeKey(k)}>Revoke</button></td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+
+    <form class="actions" style="flex-wrap:nowrap;max-width:640px" onsubmit={createKey}>
+      <input bind:value={keyName} required maxlength="60" placeholder="Name, e.g. Claude agent" />
+      <select bind:value={keyExpiry} style="width:auto" aria-label="Expires">
+        <option value="">Never expires</option>
+        <option value="30">30 days</option>
+        <option value="90">90 days</option>
+        <option value="365">1 year</option>
+      </select>
+      <button disabled={keyBusy}><Plus size={16} /> Create key</button>
+    </form>
   </div>
 
   <div class="grid-2">

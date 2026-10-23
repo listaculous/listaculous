@@ -200,9 +200,9 @@
 
   <div class="split">
     <div class="card">
-      <label class="field">Subject <input bind:value={f.subject} oninput={changed} disabled={!editable} placeholder="What's new this week" /></label>
+      <label class="field">Subject <input bind:value={f.subject} oninput={changed} disabled={!editable} placeholder="What's new this week" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
       <label class="field">Preheader <span class="muted">(inbox preview text)</span>
-        <input bind:value={f.preheader} oninput={changed} disabled={!editable} placeholder="A one-line teaser shown after the subject" /></label>
+        <input bind:value={f.preheader} oninput={changed} disabled={!editable} placeholder="A one-line teaser shown after the subject" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
       <label class="field">HTML body
         <textarea bind:this={htmlArea} rows="18" bind:value={f.html_body} oninput={changed} disabled={!editable}></textarea>
       </label>
@@ -243,7 +243,7 @@
         <pre class="code" style="min-height:400px">{preview.text}</pre>
       {/if}
       <form class="actions" style="margin-top:14px;flex-wrap:nowrap" onsubmit={(e) => { e.preventDefault(); test(); }}>
-        <input type="email" bind:value={testEmail} placeholder="Send a test to you@example.com" required />
+        <input type="email" bind:value={testEmail} placeholder="Send a test to you@example.com" required autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" />
         <button class="secondary"><FlaskConical size={15} /> Test</button>
       </form>
     </div>

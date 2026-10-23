@@ -8,7 +8,9 @@
   import Users from '@lucide/svelte/icons/users';
   import { api, fmtDate } from '../api.js';
   import { go } from '../router.svelte.js';
-  import { nav, refreshNav, initials } from '../stores.svelte.js';
+  import { nav, refreshNav } from '../stores.svelte.js';
+  import SiteIcon from '../components/SiteIcon.svelte';
+  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import SiteForm from './SiteForm.svelte';
   import Alert from '../components/Alert.svelte';
   import Empty from '../components/Empty.svelte';
@@ -55,6 +57,20 @@
     }
   }
 
+  let iconBusy = $state(false);
+  async function refreshIcon() {
+    iconBusy = true;
+    try {
+      site = await api(`/sites/${id}/icon/refresh`, { method: 'POST' });
+      msg = site.icon_url ? 'Icon updated.' : `No icon found on ${site.domain}; showing initials.`;
+      refreshNav();
+    } catch (err) {
+      error = err.message;
+    } finally {
+      iconBusy = false;
+    }
+  }
+
   async function remove() {
     if (!confirm(`Delete ${site.name}, all its newsletters, subscribers and campaigns? This cannot be undone.`)) return;
     await api(`/sites/${id}`, { method: 'DELETE' });
@@ -69,7 +85,7 @@
   <div class="crumbs"><a href="#/">Dashboard</a><ChevronRight size={14} /><span>{site.name}</span></div>
   <div class="page-head">
     <div style="display:flex;gap:14px;align-items:center">
-      <div class="site-icon" style="width:52px;height:52px;font-size:19px;border-radius:14px">{initials(site.name)}</div>
+      <SiteIcon {site} size={52} radius={14} />
       <div>
         <h1>{site.name}</h1>
         <p class="sub">{site.domain} · {site.from_name} &lt;{site.from_email}&gt; <span class="badge">{site.provider_kind}</span></p>
@@ -94,8 +110,8 @@
         <div class="card-head"><div><h2>New newsletter</h2><p class="muted small">Each newsletter has its own subscribers, signup form and campaigns.</p></div></div>
         <form onsubmit={createList}>
           <div class="grid-2">
-            <label class="field">Name <input bind:value={newList.name} required placeholder="Weekly Digest" /></label>
-            <label class="field">Description <span class="muted">(optional)</span> <input bind:value={newList.description} placeholder="The best of the week, every Friday" /></label>
+            <label class="field">Name <input bind:value={newList.name} required placeholder="Weekly Digest" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
+            <label class="field">Description <span class="muted">(optional)</span> <input bind:value={newList.description} placeholder="The best of the week, every Friday" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
           </div>
           <label class="check"><input type="checkbox" bind:checked={newList.double_opt_in} />
             <span>Require email confirmation (double opt-in)<span class="hint">Strongly recommended — protects your sender reputation and proves consent.</span></span></label>
@@ -129,6 +145,11 @@
     {/if}
   {:else if tab === 'settings'}
     <div class="card"><SiteForm {site} onSaved={(s) => { site = s; refreshNav(); }} /></div>
+    <div class="card">
+      <div class="card-head"><div style="display:flex;gap:14px;align-items:center"><SiteIcon {site} size={40} radius={10} />
+        <div><h2>Site icon</h2><p class="muted small">Fetched automatically from {site.domain}'s favicon. Re-fetch after changing it on your site.</p></div></div>
+        <button class="secondary" onclick={refreshIcon} disabled={iconBusy}><RefreshCw size={15} class={iconBusy ? 'spin' : ''} /> Refresh icon</button></div>
+    </div>
     <div class="card danger-zone">
       <div class="card-head"><div><h2>Delete site</h2><p class="muted small">Removes the site with all of its newsletters, subscribers and campaign history.</p></div>
         <button class="danger" onclick={remove}><Trash2 size={16} /> Delete site</button></div>
@@ -138,7 +159,7 @@
       <div class="card">
         <div class="card-head"><div><h2>Send a test email</h2><p class="muted small">Checks that {site.provider_kind.toUpperCase()} is configured correctly.</p></div></div>
         <form onsubmit={sendTest} class="actions" style="flex-wrap:nowrap">
-          <input type="email" bind:value={testEmail} placeholder="you@example.com" required />
+          <input type="email" bind:value={testEmail} placeholder="you@example.com" required autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" />
           <button><Send size={16} /> Send</button>
         </form>
       </div>
