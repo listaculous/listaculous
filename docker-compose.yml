@@ -1,0 +1,17 @@
+services:
+  listaculous:
+    build: .
+    image: listaculous:latest
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    env_file: .env
+    environment:
+      # Defaults to the local URL for whatever PORT you use; set BASE_URL in .env to override.
+      BASE_URL: ${BASE_URL:-http://localhost:${PORT:-8080}}
+    volumes:
+      - listaculous-data:/data
+    mem_limit: 128m
+
+volumes:
+  listaculous-data:
