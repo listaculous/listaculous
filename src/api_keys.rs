@@ -20,15 +20,15 @@ pub async fn authenticate(st: &AppState, token: &str) -> AppResult<AuthUser> {
     }
     let hash = sha256_hex(token);
     let ts = now();
-    let row: Option<(i64, i64, i64, String)> = sqlx::query_as(
-        "SELECT k.id, u.id, u.account_id, u.email FROM api_keys k JOIN users u ON u.id = k.user_id \
+    let row: Option<(i64, i64, i64, String, String)> = sqlx::query_as(
+        "SELECT k.id, u.id, u.account_id, u.email, k.scope FROM api_keys k JOIN users u ON u.id = k.user_id \
          WHERE k.token_hash = $1 AND (k.expires_at IS NULL OR k.expires_at > $2)",
     )
     .bind(&hash)
     .bind(&ts)
     .fetch_optional(&st.db)
     .await?;
-    let (key_id, id, account_id, email) = row.ok_or_else(AppError::unauthorized)?;
+    let (key_id, id, account_id, email, scope) = row.ok_or_else(AppError::unauthorized)?;
     // Record usage at most once a minute per key to keep writes low.
     let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(1))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -40,21 +40,49 @@ pub async fn authenticate(st: &AppState, token: &str) -> AppResult<AuthUser> {
         .await?;
     let mut user = AuthUser::new(id, account_id, email);
     user.via_api_key = true;
+    user.api_key_id = Some(key_id);
+    user.scope = scope;
     Ok(user)
+}
+
+pub const SCOPE_AWS_SETUP: &str = "aws_setup";
+
+/// Which endpoints a key's scope may call. Full-access keys ("") may call everything (credential
+/// management is separately restricted by `require_session`).
+pub fn scope_allows(scope: &str, method: &axum::http::Method, path: &str) -> bool {
+    match scope {
+        "" => true,
+        SCOPE_AWS_SETUP => {
+            (method == axum::http::Method::GET && path == "/api/integrations/aws-setup-script")
+                || (method == axum::http::Method::POST && path == "/api/integrations")
+        }
+        _ => false,
+    }
+}
+
+/// Deletes a single-use key once it has done its job.
+pub async fn consume(st: &AppState, user: &AuthUser) -> AppResult<()> {
+    if let (Some(id), SCOPE_AWS_SETUP) = (user.api_key_id, user.scope.as_str()) {
+        sqlx::query("DELETE FROM api_keys WHERE id = $1")
+            .bind(id)
+            .execute(&st.db)
+            .await?;
+    }
+    Ok(())
 }
 
 pub async fn list(State(st): State<AppState>, user: AuthUser) -> AppResult<Json<Value>> {
     user.require_session()?;
-    let rows: Vec<(i64, String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT id, name, prefix, created_at, last_used_at, expires_at FROM api_keys WHERE user_id = $1 ORDER BY id DESC",
+    let rows: Vec<(i64, String, String, String, Option<String>, Option<String>, String)> = sqlx::query_as(
+        "SELECT id, name, prefix, created_at, last_used_at, expires_at, scope FROM api_keys WHERE user_id = $1 ORDER BY id DESC",
     )
     .bind(user.id)
     .fetch_all(&st.db)
     .await?;
     Ok(Json(Value::Array(
         rows.into_iter()
-            .map(|(id, name, prefix, created_at, last_used_at, expires_at)| {
-                json!({ "id": id, "name": name, "prefix": prefix, "created_at": created_at,
+            .map(|(id, name, prefix, created_at, last_used_at, expires_at, scope)| {
+                json!({ "id": id, "name": name, "prefix": prefix, "created_at": created_at, "scope": scope,
                         "last_used_at": last_used_at, "expires_at": expires_at })
             })
             .collect(),
@@ -67,6 +95,9 @@ pub struct CreateKey {
     /// Optional lifetime in days; omit for a key that never expires.
     #[serde(default)]
     pub expires_in_days: Option<i64>,
+    /// "" (full access, default) or "aws_setup" (single use, 1 day, AWS CLI setup only).
+    #[serde(default)]
+    pub scope: String,
 }
 
 /// Creates a key and returns the plaintext token. It is shown exactly once.
@@ -80,7 +111,18 @@ pub async fn create(
     if name.is_empty() {
         return Err(AppError::bad_request("name is required"));
     }
-    let expires_at = match c.expires_in_days {
+    if !matches!(c.scope.as_str(), "" | SCOPE_AWS_SETUP) {
+        return Err(AppError::bad_request(
+            "scope must be empty or \"aws_setup\"",
+        ));
+    }
+    // Setup keys are short-lived no matter what was asked for.
+    let days = if c.scope == SCOPE_AWS_SETUP {
+        Some(1)
+    } else {
+        c.expires_in_days
+    };
+    let expires_at = match days {
         Some(d) if !(1..=3650).contains(&d) => {
             return Err(AppError::bad_request(
                 "expires_in_days must be between 1 and 3650",
@@ -95,7 +137,7 @@ pub async fn create(
     let token = format!("{TOKEN_PREFIX}{}", random_token(32));
     let prefix: String = token.chars().take(10).collect();
     let (id,): (i64,) = sqlx::query_as(
-        "INSERT INTO api_keys (user_id, name, prefix, token_hash, created_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        "INSERT INTO api_keys (user_id, name, prefix, token_hash, created_at, expires_at, scope) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
     )
     .bind(user.id)
     .bind(&name)
@@ -103,6 +145,7 @@ pub async fn create(
     .bind(sha256_hex(&token))
     .bind(now())
     .bind(&expires_at)
+    .bind(&c.scope)
     .fetch_one(&st.db)
     .await?;
     Ok((
@@ -128,4 +171,37 @@ pub async fn revoke(
         return Err(AppError::not_found());
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Method;
+
+    #[test]
+    fn setup_scope_is_limited() {
+        assert!(scope_allows("", &Method::DELETE, "/api/sites/1"));
+        assert!(scope_allows(
+            SCOPE_AWS_SETUP,
+            &Method::GET,
+            "/api/integrations/aws-setup-script"
+        ));
+        assert!(scope_allows(
+            SCOPE_AWS_SETUP,
+            &Method::POST,
+            "/api/integrations"
+        ));
+        assert!(!scope_allows(
+            SCOPE_AWS_SETUP,
+            &Method::GET,
+            "/api/integrations"
+        ));
+        assert!(!scope_allows(SCOPE_AWS_SETUP, &Method::GET, "/api/sites"));
+        assert!(!scope_allows(
+            SCOPE_AWS_SETUP,
+            &Method::POST,
+            "/api/sites/1/setup/apply"
+        ));
+        assert!(!scope_allows("unknown", &Method::GET, "/api/sites"));
+    }
 }

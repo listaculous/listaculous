@@ -134,6 +134,12 @@ pub async fn create(
     user: AuthUser,
     Json(c): Json<CreateIntegration>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
+    if user.scope == crate::api_keys::SCOPE_AWS_SETUP && c.kind != "aws" {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "this API key can only connect an AWS account",
+        ));
+    }
     let str_field = |k: &str| c.config[k].as_str().unwrap_or_default().trim().to_string();
     let (config, details, default_name) = match c.kind.as_str() {
         "aws" => {
@@ -200,6 +206,8 @@ pub async fn create(
     .bind(&created_at)
     .fetch_one(&st.db)
     .await?;
+    // A single-use setup key is done once it has connected an account.
+    crate::api_keys::consume(&st, &user).await?;
     Ok((
         StatusCode::CREATED,
         Json(public_json(
@@ -275,9 +283,20 @@ const AWS_SETUP_SCRIPT: &str = include_str!("scripts/aws-setup.sh");
 /// A bash script that creates the setup IAM user with the AWS CLI (policy embedded, so it always
 /// matches `setup_policy`), optionally connecting it to this server via an API key.
 pub fn aws_setup_script(base_url: &str, region: &str) -> String {
-    let region = if region.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !region.is_empty() { region } else { "us-east-1" };
+    let region = if region
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !region.is_empty()
+    {
+        region
+    } else {
+        "us-east-1"
+    };
     AWS_SETUP_SCRIPT
-        .replace("__POLICY__", &serde_json::to_string_pretty(&setup_policy()).unwrap_or_default())
+        .replace(
+            "__POLICY__",
+            &serde_json::to_string_pretty(&setup_policy()).unwrap_or_default(),
+        )
         .replace("__URL__", base_url)
         .replace("__REGION__", region)
 }
@@ -294,7 +313,10 @@ pub async fn aws_script(
     axum::extract::Query(q): axum::extract::Query<ScriptQuery>,
 ) -> impl axum::response::IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/x-shellscript; charset=utf-8",
+        )],
         aws_setup_script(&st.cfg.base_url, &q.region),
     )
 }
@@ -306,7 +328,10 @@ mod tests {
         let s = super::aws_setup_script("https://lc.example.com", "eu-west-1");
         assert!(!s.contains("__POLICY__") && !s.contains("__URL__") && !s.contains("__REGION__"));
         assert!(s.contains(r#"LISTACULOUS_URL="https://lc.example.com""#));
-        assert!(s.contains("ses:CreateEmailIdentity") && s.contains("arn:aws:iam::*:user/listaculous/*"));
+        assert!(
+            s.contains("ses:CreateEmailIdentity")
+                && s.contains("arn:aws:iam::*:user/listaculous/*")
+        );
         assert!(s.contains("${LISTACULOUS_SES_REGION:-eu-west-1}"));
         // An unsafe region can't inject into the script.
         assert!(super::aws_setup_script("https://x", "a\"; rm -rf /").contains(":-us-east-1}"));

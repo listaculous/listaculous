@@ -26,41 +26,76 @@
   let watch;
   onDestroy(() => clearTimeout(watch));
 
-  // A short-lived API key just for the script, so it can connect the new AWS key by itself.
+  // The script authenticates with a single-use "aws_setup" API key: it can only fetch the script
+  // and connect one AWS account, expires in a day, and the server deletes it once it has
+  // connected. So the page just waits for *its* key to disappear: no client-side revocation.
+  let attempt = 0;
+  let preparing = $state(false);
+  let watchNote = $state('');
+
   async function prepareCli() {
+    if (preparing || cliKey) return;
+    preparing = true;
     error = '';
+    const mine = ++attempt;
     try {
-      cliKey = await api('/auth/api-keys', { method: 'POST', body: { name: 'AWS CLI setup script', expires_in_days: 1 } });
-      watchForConnection(items.filter((i) => i.kind === 'aws').length);
+      const key = await api('/auth/api-keys', { method: 'POST', body: { name: 'AWS CLI setup script', scope: 'aws_setup' } });
+      if (mine !== attempt) {
+        // Cancelled while creating: don't leave it around.
+        api(`/auth/api-keys/${key.id}`, { method: 'DELETE' }).catch(() => {});
+        return;
+      }
+      cliKey = key;
+      watchForConnection(mine);
     } catch (err) {
       error = err.message;
+    } finally {
+      preparing = false;
     }
   }
 
-  // Poll until the script has connected an AWS account, then revoke the temporary key.
-  function watchForConnection(before) {
+  function watchForConnection(mine) {
     clearTimeout(watch);
     watch = setTimeout(async () => {
-      await load();
-      if (items.filter((i) => i.kind === 'aws').length > before) {
-        msg = 'AWS connected from the CLI. The temporary API key was revoked.';
-        await api(`/auth/api-keys/${cliKey.id}`, { method: 'DELETE' }).catch(() => {});
-        cliKey = null;
-        open = null;
-      } else {
-        watchForConnection(before);
+      if (mine !== attempt) return;
+      try {
+        const keys = await api('/auth/api-keys');
+        if (mine !== attempt) return;
+        watchNote = '';
+        if (!keys.some((k) => k.id === cliKey.id)) {
+          // The server consumed the key: the script connected an AWS account.
+          attempt++;
+          cliKey = null;
+          open = null;
+          msg = 'AWS connected from the CLI.';
+          await load();
+          return;
+        }
+      } catch (err) {
+        if (mine !== attempt) return;
+        watchNote = `Couldn't check status (${err.message}); retrying…`;
       }
+      watchForConnection(mine);
     }, 3000);
   }
 
-  // Cancelling revokes the temporary script key right away (it would expire within a day anyway).
-  function cancelCli() {
+  // Cancelling revokes the setup key right away; if that fails we say so (it still can only
+  // connect an AWS account, and expires within a day).
+  async function cancelCli() {
+    attempt++;
     clearTimeout(watch);
-    if (cliKey) api(`/auth/api-keys/${cliKey.id}`, { method: 'DELETE' }).catch(() => {});
+    const key = cliKey;
     cliKey = null;
     open = null;
+    if (key) {
+      try {
+        await api(`/auth/api-keys/${key.id}`, { method: 'DELETE' });
+      } catch (err) {
+        error = `Couldn't revoke the setup key (${err.message}). Revoke "AWS CLI setup script" under Account → API keys, or let it expire within a day.`;
+      }
+    }
   }
-  onDestroy(() => { if (cliKey) api(`/auth/api-keys/${cliKey.id}`, { method: 'DELETE' }).catch(() => {}); });
+  onDestroy(() => { attempt++; });
 
   async function loadScript() {
     script = await (await fetch(`/api/integrations/aws-setup-script?region=${encodeURIComponent(cliRegion)}`)).text();
@@ -154,9 +189,10 @@
       <label class="field" style="max-width:220px">Default SES region <input bind:value={cliRegion} {...NOFILL} oninput={() => (showScript = false)} /></label>
       {#if cliKey}
         <div style="margin-bottom:10px"><CodeBlock code={oneLiner} /></div>
-        <p class="small muted" style="display:flex;gap:8px;align-items:center"><LoaderCircle size={14} class="spin" /> Waiting for the script to connect… It uses a temporary API key that expires in a day and is revoked as soon as AWS is connected.</p>
+        <p class="small muted" style="display:flex;gap:8px;align-items:center"><LoaderCircle size={14} class="spin" /> Waiting for the script to connect… Its single-use key can only connect an AWS account, expires in a day, and is deleted as soon as AWS is connected.</p>
+        {#if watchNote}<p class="small muted">{watchNote}</p>{/if}
       {:else}
-        <button onclick={prepareCli}><Terminal size={16} /> Get the setup command</button>
+        <button onclick={prepareCli} disabled={preparing}><Terminal size={16} /> Get the setup command</button>
       {/if}
       <div class="actions" style="margin-top:12px">
         <button class="link" onclick={() => (showScript ? (showScript = false) : loadScript())}>{showScript ? 'Hide the script' : 'View the script first'}</button>
