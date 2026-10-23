@@ -70,13 +70,13 @@ pub trait Provider: Send + Sync {
 pub fn provider_for(site: &Site, http: &reqwest::Client) -> anyhow::Result<Box<dyn Provider>> {
     match site.provider_kind.as_str() {
         "ses" => {
-            let cfg: SesConfig =
-                serde_json::from_str(&site.provider_config).context("invalid SES config")?;
+            let cfg: SesConfig = serde_json::from_value(crate::crypto::open_config(&site.provider_config)?)
+                .context("invalid SES config")?;
             Ok(Box::new(SesProvider::new(cfg, http.clone())?))
         }
         "smtp" => {
-            let cfg: SmtpConfig =
-                serde_json::from_str(&site.provider_config).context("invalid SMTP config")?;
+            let cfg: SmtpConfig = serde_json::from_value(crate::crypto::open_config(&site.provider_config)?)
+                .context("invalid SMTP config")?;
             Ok(Box::new(SmtpProvider::new(cfg)?))
         }
         "log" => Ok(Box::new(LogProvider)),

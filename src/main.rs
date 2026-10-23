@@ -1,6 +1,7 @@
 mod api;
 mod api_keys;
 mod auth;
+mod crypto;
 mod db;
 mod error;
 mod favicon;
@@ -99,7 +100,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Arc::new(Config::from_env());
+    crypto::init(&cfg.database_url)?;
     let db = db::connect(&cfg.database_url).await?;
+    crypto::migrate_plaintext(&db).await?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;

@@ -10,6 +10,7 @@ argon2 = "0.5"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 axum-extra = { version = "0.10", features = ["cookie"] }
+aes-gcm = "0.10"
 base64 = "0.22"
 csv = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

@@ -62,6 +62,7 @@ curl -H "Authorization: Bearer $LISTACULOUS_KEY" http://localhost:8080/api/sites
 | `LISTACULOUS_BIND` | `0.0.0.0:8080` | |
 | `STATIC_DIR` | `web/dist` | Built admin UI |
 | `TRUST_PROXY` | `false` | Use `X-Forwarded-For` for client IP |
+| `LISTACULOUS_SECRET_KEY` | generated | Base64 32-byte key encrypting stored secrets. Auto-generated as `secret.key` next to a SQLite DB; **required** with Postgres. Back it up with your data. |
 
 ## Development
 
