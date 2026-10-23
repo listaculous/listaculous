@@ -1,0 +1,114 @@
+# Builds the multi-arch image and publishes it to GHCR on every merge to main.
+#
+# Runs on self-hosted runners (the Mac mini first, Beast as backup) so the persistent BuildKit
+# cache makes rebuilds take well under a minute. Only `push` to main (and manual dispatch by a
+# maintainer) can reach these machines; pull requests never run here (see ci.yml).
+name: Release image
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "LICENSE", "assets/**", ".github/workflows/ci.yml"]
+  workflow_dispatch:
+
+# A newer merge supersedes an in-progress build.
+concurrency:
+  group: release-main
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/listaculous/listaculous
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  # Picks the primary runner if it's online, else the backup. (A job aimed at an offline runner
+  # would just queue, so this has to be decided before the build job starts.) Without the
+  # RUNNER_STATUS_TOKEN secret it falls back to "any listaculous runner".
+  pick-runner:
+    # Manual runs can pick any branch; only main may publish the production tags.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      labels: ${{ steps.pick.outputs.labels }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          pick='["self-hosted","listaculous"]'
+          if [ -n "$GH_TOKEN" ]; then
+            online=$(gh api "repos/$REPO/actions/runners" --jq '[.runners[] | select(.status=="online") | .labels[].name]' 2>/dev/null || echo '[]')
+            if echo "$online" | grep -q '"primary"'; then pick='["self-hosted","listaculous","primary"]'
+            elif echo "$online" | grep -q '"backup"'; then pick='["self-hosted","listaculous","backup"]'
+            fi
+          fi
+          echo "Using runner labels: $pick"
+          echo "labels=$pick" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: pick-runner
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.labels) }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Persistent builder
+        run: |
+          # Keep one long-lived builder so BuildKit cache mounts (cargo registry, target dirs,
+          # npm) survive between runs; recreate it only if it's missing or broken.
+          if ! docker buildx inspect listaculous-ci --bootstrap >/dev/null 2>&1; then
+            docker buildx rm listaculous-ci >/dev/null 2>&1 || true
+            docker buildx create --name listaculous-ci --driver docker-container \
+              --buildkitd-config .github/buildkit/buildkitd.toml --bootstrap
+          fi
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Tags
+        id: meta
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          short=${GITHUB_SHA::7}
+          {
+            echo "version=$version"
+            echo "tags=-t $IMAGE:latest -t $IMAGE:main -t $IMAGE:sha-$short -t $IMAGE:$version -t $IMAGE:${version%.*}"
+            echo "smoke=$IMAGE:smoke-$short"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and smoke-test (native arch)
+        run: |
+          # Uses the same cache as the release build, so this adds only seconds.
+          docker buildx build --builder listaculous-ci --load -t "${{ steps.meta.outputs.smoke }}" .
+          cid=$(docker run -d --rm -e BASE_URL=http://localhost "${{ steps.meta.outputs.smoke }}")
+          trap 'docker rm -f "$cid" >/dev/null 2>&1; docker rmi "${{ steps.meta.outputs.smoke }}" >/dev/null 2>&1' EXIT
+          for _ in $(seq 1 20); do
+            if docker exec "$cid" wget -qO- http://127.0.0.1:8080/healthz 2>/dev/null | grep -q ok; then
+              echo "healthz ok"; exit 0
+            fi
+            sleep 0.5
+          done
+          docker logs "$cid"; echo "smoke test failed" >&2; exit 1
+
+      - name: Build and push (amd64 + arm64)
+        run: |
+          docker buildx build --builder listaculous-ci --platform "$PLATFORMS" --push \
+            ${{ steps.meta.outputs.tags }} \
+            --label org.opencontainers.image.revision=${{ github.sha }} \
+            --label org.opencontainers.image.version=${{ steps.meta.outputs.version }} \
+            .
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published \`$IMAGE\`"
+            echo "Tags: \`latest\`, \`main\`, \`${{ steps.meta.outputs.version }}\`, \`sha-${GITHUB_SHA::7}\` (linux/amd64, linux/arm64)"
+            echo "Built on: \`${RUNNER_NAME}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

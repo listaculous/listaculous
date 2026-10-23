@@ -41,6 +41,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 1
+# 16 parallel units: much faster release builds; thin LTO keeps the binary small.
+codegen-units = 16
 strip = true
 panic = "abort"

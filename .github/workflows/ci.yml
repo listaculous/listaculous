@@ -1,0 +1,54 @@
+# Checks for pull requests. Runs on GitHub-hosted runners only: pull requests (including from
+# forks) never run on the self-hosted build machines.
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo test --locked
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: OpenAPI spec is valid
+        run: |
+          pip install --quiet openapi-spec-validator pyyaml
+          python -c "import yaml; from openapi_spec_validator import validate; validate(yaml.safe_load(open('openapi.yaml')))"
+      - name: shellcheck the AWS setup script
+        run: shellcheck -S warning src/scripts/aws-setup.sh

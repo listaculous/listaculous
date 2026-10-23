@@ -1,0 +1,25 @@
+# Self-host Listaculous from the published image (no build needed).
+#
+#   curl -fsSLO https://raw.githubusercontent.com/listaculous/listaculous/main/deploy/docker-compose.yml
+#   curl -fsSL  https://raw.githubusercontent.com/listaculous/listaculous/main/deploy/.env.example -o .env
+#   # edit .env (BASE_URL at least), then:
+#   docker compose up -d
+#
+# Update: docker compose pull && docker compose up -d   (migrations run automatically)
+services:
+  listaculous:
+    # Pin a version for production (e.g. :0.1); :latest follows main.
+    image: ghcr.io/listaculous/listaculous:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Only reachable from this host, for a reverse proxy here (see Caddyfile). .env trusts
+      # X-Forwarded-For, which is only safe if clients can't bypass the proxy. To expose it
+      # directly instead, use "8080:8080" AND set TRUST_PROXY=false.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - listaculous-data:/data
+    mem_limit: 128m
+
+volumes:
+  listaculous-data:
