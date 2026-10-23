@@ -448,6 +448,21 @@ async fn build_plan(
         Ok(v) => destination_ok(&v, &topic_arn),
         Err(_) => false,
     };
+    // Only "done" if SNS will actually deliver: the webhook subscription must be confirmed.
+    let feedback_done = feedback_done
+        && match aws
+            .query(
+                "sns",
+                &[
+                    ("Action", "ListSubscriptionsByTopic"),
+                    ("TopicArn", &topic_arn),
+                ],
+            )
+            .await
+        {
+            Ok(xml) => subscription_state(&xml, &t.webhook_url) == SubState::Confirmed,
+            Err(_) => false,
+        };
     steps.push(json!({ "id": "feedback", "title": "Send bounces & complaints to Listaculous (configuration set + SNS)",
         "action": if feedback_done { "exists" } else if t.webhook_public { "create" } else { "skip" },
         "note": if t.webhook_public || feedback_done { Value::Null } else { json!(format!("BASE_URL ({}) must be a public https:// URL for AWS to reach the webhook; re-run setup after deploying", st.cfg.base_url)) } }));
@@ -622,7 +637,10 @@ async fn run(
                 ],
             )
             .await?;
-        if !subs.contains(&t.webhook_url.replace('&', "&amp;")) && !subs.contains(&t.webhook_url) {
+        // HTTPS subscriptions deliver nothing until the endpoint confirms them, so a pending one
+        // is (re)subscribed, which makes SNS resend the confirmation request.
+        let sub_state = subscription_state(&subs, &t.webhook_url);
+        if sub_state != SubState::Confirmed {
             aws.query(
                 "sns",
                 &[
@@ -672,14 +690,23 @@ async fn run(
             Err(e) => return Err(e.into()),
         }
         state["resources"]["topic_arn"] = topic_arn.clone().into();
+        let detail = if sub_state == SubState::Confirmed {
+            format!("bounces & complaints → {topic_arn} → webhook")
+        } else {
+            format!("bounces & complaints → {topic_arn}; waiting for the webhook to confirm the SNS subscription (needs {} to be reachable from the internet). Re-run setup if this doesn't clear.", st.cfg.base_url)
+        };
         step(
             st,
             site_id,
             run_id,
             state,
             "feedback",
-            "done",
-            format!("bounces & complaints → {topic_arn} → webhook"),
+            if sub_state == SubState::Confirmed {
+                "done"
+            } else {
+                "pending"
+            },
+            detail,
         )
         .await?;
     } else {
@@ -967,6 +994,31 @@ async fn run(
     )
     .await?;
     Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+enum SubState {
+    Missing,
+    Pending,
+    Confirmed,
+}
+
+/// Our webhook's subscription state in a `ListSubscriptionsByTopic` response. Pending ones have
+/// `SubscriptionArn` = `PendingConfirmation`.
+fn subscription_state(xml: &str, endpoint: &str) -> SubState {
+    let escaped = endpoint.replace('&', "&amp;");
+    let mut state = SubState::Missing;
+    for m in xml.split("<member>").skip(1) {
+        let ep = xml_tag(m, "Endpoint").unwrap_or_default();
+        if ep != endpoint && ep != escaped {
+            continue;
+        }
+        match xml_tag(m, "SubscriptionArn").as_deref() {
+            Some(arn) if arn.starts_with("arn:") => return SubState::Confirmed,
+            _ => state = SubState::Pending,
+        }
+    }
+    state
 }
 
 /// Active access key ids from an IAM `ListAccessKeys` response.
@@ -1448,6 +1500,17 @@ mod tests {
             "dkim.example-zone.amazonses.com",
             "SES's reported zone wins"
         );
+    }
+
+    #[test]
+    fn sns_subscription_states() {
+        let ep = "https://lc.example.com/webhooks/ses/1/abc";
+        let pending = format!("<Subscriptions><member><SubscriptionArn>PendingConfirmation</SubscriptionArn><Endpoint>{ep}</Endpoint></member></Subscriptions>");
+        let confirmed = format!("<Subscriptions><member><SubscriptionArn>arn:aws:sns:us-east-1:1:t:uuid</SubscriptionArn><Endpoint>{ep}</Endpoint></member></Subscriptions>");
+        let other = "<Subscriptions><member><SubscriptionArn>arn:aws:sns:x</SubscriptionArn><Endpoint>https://other</Endpoint></member></Subscriptions>";
+        assert_eq!(subscription_state(&pending, ep), SubState::Pending);
+        assert_eq!(subscription_state(&confirmed, ep), SubState::Confirmed);
+        assert_eq!(subscription_state(other, ep), SubState::Missing);
     }
 
     #[test]

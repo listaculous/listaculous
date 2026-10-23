@@ -176,6 +176,32 @@
 
   {#if error}<Alert kind="error">{error}</Alert>{/if}
 
+  <!-- Saved progress shows even if the AWS integration has since been removed. -->
+    {#if setup.status === 'running' || setup.status === 'applied' || setup.status === 'error'}
+    <div class="setup-steps">
+      {#each stepOrder as id (id)}
+        {@const s = setup.state?.steps?.[id]}
+        {@const Icon = icon(s?.status)}
+        <div class="setup-step {s?.status ?? 'pending'}">
+          <Icon size={17} class={s?.status === 'running' ? 'spin' : ''} />
+          <div><div class="cell-strong">{stepNames[id]}</div>{#if s?.detail}<div class="small muted">{s.detail}</div>{/if}</div>
+        </div>
+      {/each}
+    </div>
+    {#if setup.status === 'error'}<Alert kind="error">Setup stopped: {setup.state.error}. Fix the cause and run it again. Steps already done are skipped.</Alert>{/if}
+    {#if setup.verification_error}<Alert kind="warn">{setup.verification_error}</Alert>{/if}
+    {#if setup.verification}
+      <div class="actions" style="margin:4px 0 16px">
+        <span class="badge {verified(setup.verification.dkim) ? 'confirmed' : 'pending'}">DKIM {setup.verification.dkim?.toLowerCase()}</span>
+        <span class="badge {verified(setup.verification.mail_from) ? 'confirmed' : 'pending'}">MAIL FROM {setup.verification.mail_from?.toLowerCase()}</span>
+        <span class="badge {setup.verification.verified_for_sending ? 'confirmed' : 'pending'}">{setup.verification.verified_for_sending ? 'ready to send' : 'waiting for DNS'}</span>
+        <button class="ghost" onclick={refresh}><RefreshCw size={14} /> Check now</button>
+      </div>
+      {#if !verified(setup.verification.dkim)}<p class="small muted" style="margin-top:-8px">DNS changes usually verify within minutes, occasionally a few hours. This page checks automatically.</p>{/if}
+    {/if}
+  {/if}
+
+
   {#if !hasAws}
     <Alert kind="info">Connect an AWS account (and optionally Porkbun) on the <a href="#/integrations">Integrations</a> page to enable automatic setup.</Alert>
   {:else}
@@ -193,30 +219,6 @@
       </label>
       <label class="field">SES region <input bind:value={region} oninput={selectionChanged} disabled={busy} placeholder="us-east-1" autocomplete="off" data-bwignore /></label>
     </div>
-
-    {#if setup.status === 'running' || setup.status === 'applied' || setup.status === 'error'}
-      <div class="setup-steps">
-        {#each stepOrder as id (id)}
-          {@const s = setup.state?.steps?.[id]}
-          {@const Icon = icon(s?.status)}
-          <div class="setup-step {s?.status ?? 'pending'}">
-            <Icon size={17} class={s?.status === 'running' ? 'spin' : ''} />
-            <div><div class="cell-strong">{stepNames[id]}</div>{#if s?.detail}<div class="small muted">{s.detail}</div>{/if}</div>
-          </div>
-        {/each}
-      </div>
-      {#if setup.status === 'error'}<Alert kind="error">Setup stopped: {setup.state.error}. Fix the cause and run it again. Steps already done are skipped.</Alert>{/if}
-      {#if setup.verification_error}<Alert kind="warn">{setup.verification_error}</Alert>{/if}
-      {#if setup.verification}
-        <div class="actions" style="margin:4px 0 16px">
-          <span class="badge {verified(setup.verification.dkim) ? 'confirmed' : 'pending'}">DKIM {setup.verification.dkim?.toLowerCase()}</span>
-          <span class="badge {verified(setup.verification.mail_from) ? 'confirmed' : 'pending'}">MAIL FROM {setup.verification.mail_from?.toLowerCase()}</span>
-          <span class="badge {setup.verification.verified_for_sending ? 'confirmed' : 'pending'}">{setup.verification.verified_for_sending ? 'ready to send' : 'waiting for DNS'}</span>
-          <button class="ghost" onclick={refresh}><RefreshCw size={14} /> Check now</button>
-        </div>
-        {#if !verified(setup.verification.dkim)}<p class="small muted" style="margin-top:-8px">DNS changes usually verify within minutes, occasionally a few hours. This page checks automatically.</p>{/if}
-      {/if}
-    {/if}
 
     {#if plan}
       <div class="card flush" style="margin:8px 0 16px;box-shadow:none">

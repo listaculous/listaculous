@@ -52,29 +52,53 @@ fn key_file(database_url: &str) -> anyhow::Result<Vec<u8>> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
     let file = dir.join("secret.key");
-    if let Ok(s) = std::fs::read_to_string(&file) {
-        return B64.decode(s.trim()).context("reading secret.key");
+    if let Some(key) = read_key(&file)? {
+        return Ok(key);
     }
+    // Publish atomically: write + fsync a private temp file, then hard-link it into place. The
+    // link fails if another process created the key first; then we use theirs. A crash can never
+    // leave a partial secret.key.
     let key = Aes256Gcm::generate_key(OsRng);
     std::fs::create_dir_all(dir)?;
-    write_private(&file, B64.encode(key).as_bytes())?;
-    tracing::warn!(
-        "generated encryption key at {} — back it up with your database",
-        file.display()
-    );
-    Ok(key.to_vec())
+    let tmp = dir.join(format!(".secret.key.{}", crate::db::random_token(8)));
+    write_private(&tmp, B64.encode(key).as_bytes())?;
+    let linked = std::fs::hard_link(&tmp, &file);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {
+            tracing::warn!(
+                "generated encryption key at {} — back it up with your database",
+                file.display()
+            );
+            Ok(key.to_vec())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_key(&file)?.ok_or_else(|| anyhow!("{} exists but is empty", file.display()))
+        }
+        Err(e) => Err(e).context("creating secret.key"),
+    }
+}
+
+fn read_key(file: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match std::fs::read_to_string(file) {
+        Ok(s) if s.trim().is_empty() => bail!("{} is empty; restore it from a backup (or delete it only if no secrets are stored yet)", file.display()),
+        Ok(s) => Ok(Some(B64.decode(s.trim()).context("reading secret.key")?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).context("reading secret.key"),
+    }
 }
 
 #[cfg(unix)]
 fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?
-        .write_all(data)
+        .open(path)?;
+    f.write_all(data)?;
+    f.sync_all()
 }
 
 #[cfg(not(unix))]
