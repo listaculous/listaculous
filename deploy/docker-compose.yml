@@ -1,0 +1,23 @@
+# Self-host Listaculous from the published image (no build needed).
+#
+#   curl -fsSLO https://raw.githubusercontent.com/listaculous/listaculous/main/deploy/docker-compose.yml
+#   curl -fsSL  https://raw.githubusercontent.com/listaculous/listaculous/main/deploy/.env.example -o .env
+#   # edit .env (BASE_URL at least), then:
+#   docker compose up -d
+#
+# Update: docker compose pull && docker compose up -d   (migrations run automatically)
+services:
+  listaculous:
+    # Pin a version for production (e.g. :0.1); :latest follows main.
+    image: ghcr.io/listaculous/listaculous:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Behind a reverse proxy on the same host, keep it private: "127.0.0.1:8080:8080".
+      - "8080:8080"
+    volumes:
+      - listaculous-data:/data
+    mem_limit: 128m
+
+volumes:
+  listaculous-data:
