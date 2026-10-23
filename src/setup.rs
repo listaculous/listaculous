@@ -94,9 +94,10 @@ fn target(st: &AppState, site: Site) -> AppResult<Target> {
             || host.parse::<std::net::IpAddr>().is_ok());
     Ok(Target {
         mail_from: format!("bounce.{identity}"),
-        config_set: format!("listaculous-site-{}", site.id),
-        topic: format!("listaculous-site-{}-feedback", site.id),
-        iam_user: format!("listaculous-site-{}-sender", site.id),
+        // Namespaced by installation so several installs can share one AWS account.
+        config_set: format!("listaculous-{}-site-{}", st.instance_id, site.id),
+        topic: format!("listaculous-{}-site-{}-feedback", st.instance_id, site.id),
+        iam_user: format!("listaculous-{}-site-{}-sender", st.instance_id, site.id),
         zone,
         identity,
         webhook_url,
@@ -123,6 +124,29 @@ fn aws_err(e: AwsError) -> AppError {
         ""
     };
     AppError::bad_request(format!("{e}{hint}"))
+}
+
+fn dest_body(topic_arn: &str) -> Value {
+    json!({ "Enabled": true, "MatchingEventTypes": ["BOUNCE", "COMPLAINT"], "SnsDestination": { "TopicArn": topic_arn } })
+}
+
+/// Whether our event destination exists, is enabled, covers bounces + complaints and targets the topic.
+fn destination_ok(destinations: &Value, topic_arn: &str) -> bool {
+    destinations["EventDestinations"]
+        .as_array()
+        .is_some_and(|all| {
+            all.iter().any(|d| {
+                let types: Vec<&str> = d["MatchingEventTypes"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
+                    .unwrap_or_default();
+                d["Name"] == EVENT_DESTINATION
+                    && d["Enabled"].as_bool().unwrap_or(false)
+                    && types.contains(&"BOUNCE")
+                    && types.contains(&"COMPLAINT")
+                    && d["SnsDestination"]["TopicArn"].as_str() == Some(topic_arn)
+            })
+        })
 }
 
 /// The records SES needs, given the DKIM tokens (if the identity exists yet).
@@ -170,33 +194,43 @@ fn wanted_records(t: &Target, region: &str, dkim_tokens: &[String]) -> Vec<(Stri
     out
 }
 
-/// Compares a wanted record with what's in the zone: "exists", "create" or "conflict".
+/// Compares a wanted record with *all* records at its name: "exists", "create" or "conflict".
+/// A matching record doesn't hide an incompatible neighbour (e.g. a second MX or SPF).
 fn record_state(wanted: &Record, existing: &[Record]) -> (&'static str, Option<String>) {
+    let matches = |e: &Record| {
+        e.kind == wanted.kind
+            && same_content(&wanted.kind, &e.content, &wanted.content)
+            && (wanted.kind != "MX" || e.priority.unwrap_or(0) == wanted.priority.unwrap_or(0))
+    };
     let same_name: Vec<&Record> = existing
         .iter()
         .filter(|e| e.name.eq_ignore_ascii_case(&wanted.name))
         .collect();
-    if same_name
-        .iter()
-        .any(|e| e.kind == wanted.kind && same_content(&wanted.kind, &e.content, &wanted.content))
-    {
-        return ("exists", None);
-    }
-    // A CNAME can't coexist with anything; a second SPF / MX at the same name would break mail.
+    // A CNAME can't coexist with anything; a second MX or SPF at the same name would break mail.
     let clash = same_name.iter().find(|e| {
-        e.kind == "CNAME"
-            || wanted.kind == "CNAME"
-            || (wanted.kind == "MX" && e.kind == "MX")
-            || (wanted.kind == "TXT"
-                && e.kind == "TXT"
-                && e.content.trim_matches('"').starts_with("v=spf1"))
+        !matches(e)
+            && (e.kind == "CNAME"
+                || wanted.kind == "CNAME"
+                || (wanted.kind == "MX" && e.kind == "MX")
+                || (wanted.kind == "TXT"
+                    && e.kind == "TXT"
+                    && e.content.trim_matches('"').starts_with("v=spf1")))
     });
-    match clash {
-        Some(e) => (
+    if let Some(e) = clash {
+        let prio = if e.kind == "MX" {
+            format!("{} ", e.priority.unwrap_or(0))
+        } else {
+            String::new()
+        };
+        return (
             "conflict",
-            Some(format!("existing {} record: {}", e.kind, e.content)),
-        ),
-        None => ("create", None),
+            Some(format!("existing {} record: {prio}{}", e.kind, e.content)),
+        );
+    }
+    if same_name.iter().any(|e| matches(e)) {
+        ("exists", None)
+    } else {
+        ("create", None)
     }
 }
 
@@ -306,7 +340,10 @@ async fn build_plan(
         "note": if has_dmarc { "existing DMARC policy kept" } else { "monitoring-only policy; tighten later" } }));
 
     // Report what's already in place so a re-run plan reads accurately (all read-only checks).
-    let mail_from_done = identity.as_ref().and_then(|i| i["MailFromAttributes"]["MailFromDomain"].as_str()) == Some(t.mail_from.as_str());
+    let mail_from_done = identity
+        .as_ref()
+        .and_then(|i| i["MailFromAttributes"]["MailFromDomain"].as_str())
+        == Some(t.mail_from.as_str());
     steps.push(json!({ "id": "mail_from", "title": format!("Use {} as the MAIL FROM domain (SPF alignment)", t.mail_from),
         "action": if mail_from_done { "exists" } else { "create" } }));
     let dns_action = if manual {
@@ -320,15 +357,31 @@ async fn build_plan(
     };
     steps.push(json!({ "id": "dns", "title": if manual { "Add the DNS records below at your DNS provider".to_string() } else { format!("Add DNS records in {}", dns_int.map(|d| d.name.as_str()).unwrap_or("")) },
         "action": dns_action }));
-    let feedback_done = match aws.ses("GET", &format!("/v2/email/configuration-sets/{}/event-destinations", t.config_set), None).await {
-        Ok(v) => v["EventDestinations"].as_array().is_some_and(|d| d.iter().any(|e| e["Name"] == EVENT_DESTINATION)),
+    let (account_id, _) = aws
+        .caller_identity()
+        .await
+        .map_err(|e| AppError::bad_request(format!("{e:#}")))?;
+    let topic_arn = format!("arn:aws:sns:{}:{account_id}:{}", aws.region, t.topic);
+    let feedback_done = match aws
+        .ses(
+            "GET",
+            &format!(
+                "/v2/email/configuration-sets/{}/event-destinations",
+                t.config_set
+            ),
+            None,
+        )
+        .await
+    {
+        Ok(v) => destination_ok(&v, &topic_arn),
         Err(_) => false,
     };
     steps.push(json!({ "id": "feedback", "title": "Send bounces & complaints to Listaculous (configuration set + SNS)",
         "action": if feedback_done { "exists" } else if t.webhook_public { "create" } else { "skip" },
         "note": if t.webhook_public || feedback_done { Value::Null } else { json!(format!("BASE_URL ({}) must be a public https:// URL for AWS to reach the webhook; re-run setup after deploying", st.cfg.base_url)) } }));
     let current = crate::crypto::open_config(&t.site.provider_config).unwrap_or_default();
-    let sender_done = t.site.provider_kind == "ses" && current["configuration_set"].as_str() == Some(t.config_set.as_str());
+    let sender_done = t.site.provider_kind == "ses"
+        && current["configuration_set"].as_str() == Some(t.config_set.as_str());
     steps.push(json!({ "id": "sender", "title": format!("Create send-only IAM user {} and switch the site to it", t.iam_user),
         "action": if sender_done { "exists" } else { "create" } }));
 
@@ -381,23 +434,22 @@ pub async fn apply(
         return Err(AppError::bad_request("some DNS records conflict with existing ones; resolve them (see the plan) and try again"));
     }
 
-    // Only one run at a time per site.
-    let previous = load_state(&st, id).await?;
-    if previous
-        .as_ref()
-        .is_some_and(|(status, _)| status == "running")
-    {
+    let mut state = load_state(&st, id)
+        .await?
+        .map(|(_, s)| s)
+        .unwrap_or_else(|| json!({}));
+    state["plan"] = plan;
+    state["steps"] = json!({});
+    state["error"] = Value::Null;
+    state["started_at"] = now().into();
+    // Atomically claim the run: only one at a time per site. A "running" row that hasn't been
+    // touched for RUN_LEASE is considered abandoned and can be taken over.
+    if !claim_run(&st, id, &state).await? {
         return Err(AppError::new(
             axum::http::StatusCode::CONFLICT,
             "setup is already running for this site",
         ));
     }
-    let mut state = previous.map(|(_, s)| s).unwrap_or_else(|| json!({}));
-    state["plan"] = plan;
-    state["steps"] = json!({});
-    state["error"] = Value::Null;
-    state["started_at"] = now().into();
-    save_state(&st, id, "running", &state).await?;
 
     let st2 = st.clone();
     tokio::spawn(async move {
@@ -504,10 +556,7 @@ async fn run(
             )
             .await?;
         }
-        let dest = json!({
-            "EventDestinationName": EVENT_DESTINATION,
-            "EventDestination": { "Enabled": true, "MatchingEventTypes": ["BOUNCE", "COMPLAINT"], "SnsDestination": { "TopicArn": topic_arn } }
-        });
+        let dest = json!({ "EventDestinationName": EVENT_DESTINATION, "EventDestination": dest_body(&topic_arn) });
         match aws
             .ses(
                 "POST",
@@ -520,7 +569,27 @@ async fn run(
             .await
         {
             Ok(_) => {}
-            Err(e) if e.code == "AlreadyExistsException" => {}
+            // Exists already: make sure it's enabled, covers bounces + complaints and targets our topic.
+            Err(e) if e.code == "AlreadyExistsException" => {
+                let current = aws
+                    .ses(
+                        "GET",
+                        &format!(
+                            "/v2/email/configuration-sets/{}/event-destinations",
+                            t.config_set
+                        ),
+                        None,
+                    )
+                    .await?;
+                if !destination_ok(&current, &topic_arn) {
+                    aws.ses(
+                        "PUT",
+                        &format!("/v2/email/configuration-sets/{}/event-destinations/{EVENT_DESTINATION}", t.config_set),
+                        Some(json!({ "EventDestination": dest_body(&topic_arn) })),
+                    )
+                    .await?;
+                }
+            }
             Err(e) => return Err(e.into()),
         }
         state["resources"]["topic_arn"] = topic_arn.clone().into();
@@ -709,7 +778,9 @@ async fn run(
             .as_str()
             .is_some_and(|k| !k.is_empty())
         && state["resources"]["iam_user"].as_str() == Some(t.iam_user.as_str())
-        && current["access_key_id"].as_str() == state["resources"]["access_key_id"].as_str();
+        && current["access_key_id"].as_str() == state["resources"]["access_key_id"].as_str()
+        // A key from another AWS account can't send for this one.
+        && state["resources"]["aws_account_id"].as_str() == Some(account_id.as_str());
     let (key_id, secret) = if have_key {
         (
             current["access_key_id"]
@@ -749,6 +820,7 @@ async fn run(
         .await?;
     state["resources"]["iam_user"] = t.iam_user.clone().into();
     state["resources"]["access_key_id"] = key_id.clone().into();
+    state["resources"]["aws_account_id"] = account_id.clone().into();
     step(
         st,
         site_id,
@@ -767,6 +839,40 @@ async fn run(
 
 // ---------------------------------------------------------------------------------------
 // Status & verification
+
+/// A running setup that hasn't saved progress for this long is treated as abandoned.
+const RUN_LEASE_MINUTES: i64 = 15;
+
+async fn claim_run(st: &AppState, site_id: i64, state: &Value) -> AppResult<bool> {
+    let stale = (chrono::Utc::now() - chrono::Duration::minutes(RUN_LEASE_MINUTES))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let r = sqlx::query(
+        "INSERT INTO site_setups (site_id, status, state, updated_at) VALUES ($1, 'running', $2, $3) \
+         ON CONFLICT (site_id) DO UPDATE SET status = 'running', state = excluded.state, updated_at = excluded.updated_at \
+         WHERE site_setups.status <> 'running' OR site_setups.updated_at < $4",
+    )
+    .bind(site_id)
+    .bind(state.to_string())
+    .bind(now())
+    .bind(stale)
+    .execute(&st.db)
+    .await?;
+    Ok(r.rows_affected() == 1)
+}
+
+/// At startup no setup can be running: mark runs cut off by a restart as failed (retryable).
+pub async fn recover_interrupted(db: &crate::db::Db) -> anyhow::Result<()> {
+    let r = sqlx::query("UPDATE site_setups SET status = 'error' WHERE status = 'running'")
+        .execute(db)
+        .await?;
+    if r.rows_affected() > 0 {
+        tracing::warn!(
+            "{} setup run(s) were interrupted by a restart; they can be re-run",
+            r.rows_affected()
+        );
+    }
+    Ok(())
+}
 
 async fn load_state(st: &AppState, site_id: i64) -> AppResult<Option<(String, Value)>> {
     let row: Option<(String, String)> =
@@ -805,6 +911,10 @@ async fn status_json(
     let Some((status, state)) = load_state(st, site_id).await? else {
         return Ok(json!({ "status": "not_started" }));
     };
+    let mut state = state;
+    if status == "error" && state["error"].is_null() {
+        state["error"] = "interrupted by a server restart".into();
+    }
     let mut out = json!({ "status": status, "state": state });
     if verify {
         if let (Some(aws), Some(identity)) = (aws, state["plan"]["identity"].as_str()) {
@@ -987,6 +1097,46 @@ mod tests {
             "conflict",
             "never add a second SPF record"
         );
+    }
+
+    #[test]
+    fn a_match_does_not_hide_conflicting_neighbours() {
+        let mut ses_mx = rec("bounce.news", "MX", "feedback-smtp.us-east-1.amazonses.com");
+        ses_mx.priority = Some(10);
+        let mut other_mx = rec("bounce.news", "MX", "mx.other.example");
+        other_mx.priority = Some(5);
+        let want = ses_mx.clone();
+        assert_eq!(record_state(&want, &[ses_mx.clone()]).0, "exists");
+        assert_eq!(
+            record_state(&want, &[ses_mx.clone(), other_mx]).0,
+            "conflict",
+            "a second MX breaks MAIL FROM"
+        );
+        let mut wrong_prio = ses_mx.clone();
+        wrong_prio.priority = Some(20);
+        assert_eq!(record_state(&want, &[wrong_prio]).0, "conflict");
+        let spf = rec("bounce.news", "TXT", "v=spf1 include:amazonses.com ~all");
+        let extra_spf = rec("bounce.news", "TXT", "v=spf1 -all");
+        assert_eq!(
+            record_state(&spf, &[spf.clone(), extra_spf]).0,
+            "conflict",
+            "two SPF records are invalid"
+        );
+    }
+
+    #[test]
+    fn event_destination_must_match() {
+        let topic = "arn:aws:sns:us-east-1:1:t";
+        let good = json!({ "EventDestinations": [{ "Name": EVENT_DESTINATION, "Enabled": true,
+            "MatchingEventTypes": ["BOUNCE", "COMPLAINT"], "SnsDestination": { "TopicArn": topic } }] });
+        assert!(destination_ok(&good, topic));
+        let mut disabled = good.clone();
+        disabled["EventDestinations"][0]["Enabled"] = false.into();
+        assert!(!destination_ok(&disabled, topic));
+        let mut no_complaints = good.clone();
+        no_complaints["EventDestinations"][0]["MatchingEventTypes"] = json!(["BOUNCE"]);
+        assert!(!destination_ok(&no_complaints, topic));
+        assert!(!destination_ok(&good, "arn:aws:sns:us-east-1:1:other"));
     }
 
     #[test]

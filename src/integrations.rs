@@ -244,6 +244,7 @@ pub fn setup_policy() -> Value {
                     "ses:PutEmailIdentityMailFromAttributes", "ses:PutEmailIdentityConfigurationSetAttributes",
                     "ses:CreateConfigurationSet", "ses:GetConfigurationSet",
                     "ses:CreateConfigurationSetEventDestination", "ses:GetConfigurationSetEventDestinations",
+                    "ses:UpdateConfigurationSetEventDestination",
                     "ses:TagResource"
                 ],
                 "Resource": "*"

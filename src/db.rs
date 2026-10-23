@@ -58,6 +58,22 @@ fn redact(url: &str) -> String {
     }
 }
 
+/// A short random id for this installation, created once and kept in the settings table.
+pub async fn instance_id(db: &Db) -> anyhow::Result<String> {
+    let mut buf = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut buf);
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('instance_id', $1) ON CONFLICT (key) DO NOTHING",
+    )
+    .bind(hex::encode(buf))
+    .execute(db)
+    .await?;
+    let (id,): (String,) = sqlx::query_as("SELECT value FROM settings WHERE key = 'instance_id'")
+        .fetch_one(db)
+        .await?;
+    Ok(id)
+}
+
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }

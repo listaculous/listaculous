@@ -165,7 +165,7 @@ impl Aws {
         path: &str,
         content_type: &str,
         body: Vec<u8>,
-    ) -> anyhow::Result<(u16, String)> {
+    ) -> anyhow::Result<(u16, Option<String>, String)> {
         let headers = [
             ("host", host.to_string()),
             ("content-type", content_type.to_string()),
@@ -191,7 +191,13 @@ impl Aws {
         }
         let resp = req.send().await?;
         let status = resp.status().as_u16();
-        Ok((status, resp.text().await.unwrap_or_default()))
+        // REST-JSON errors may identify themselves only via this header.
+        let error_type = resp
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        Ok((status, error_type, resp.text().await.unwrap_or_default()))
     }
 
     /// SES v2 REST/JSON call, e.g. `ses("POST", "/v2/email/identities", Some(body))`.
@@ -205,7 +211,7 @@ impl Aws {
         let bytes = body
             .map(|b| serde_json::to_vec(&b).unwrap_or_default())
             .unwrap_or_default();
-        let (status, text) = self
+        let (status, error_type, text) = self
             .send(
                 "ses",
                 &self.region,
@@ -225,13 +231,9 @@ impl Aws {
         if (200..300).contains(&status) {
             return Ok(v);
         }
-        let code = v["__type"]
-            .as_str()
-            .or_else(|| v["code"].as_str())
-            .unwrap_or("Error");
         Err(AwsError {
             status,
-            code: code.rsplit('#').next().unwrap_or(code).to_string(),
+            code: error_code(error_type.as_deref(), &v),
             message: v["message"]
                 .as_str()
                 .or_else(|| v["Message"].as_str())
@@ -271,7 +273,7 @@ impl Aws {
         let body = serde_urlencoded::to_string(&form)
             .unwrap_or_default()
             .into_bytes();
-        let (status, text) = self
+        let (status, _, text) = self
             .send(
                 service,
                 &region,
@@ -307,6 +309,20 @@ impl Aws {
             xml_tag(&xml, "Arn").unwrap_or_default(),
         ))
     }
+}
+
+/// Error code for a REST-JSON error: the `x-amzn-errortype` header (e.g.
+/// `AlreadyExistsException:http://internal.amazon.com/...`), else `__type` / `code` in the body
+/// (possibly namespaced like `com.amazon.coral#AlreadyExistsException`).
+pub fn error_code(header: Option<&str>, body: &Value) -> String {
+    let raw = header
+        .filter(|h| !h.is_empty())
+        .or_else(|| body["__type"].as_str())
+        .or_else(|| body["code"].as_str())
+        .or_else(|| body["Code"].as_str())
+        .unwrap_or("Error");
+    let raw = raw.split(':').next().unwrap_or(raw);
+    raw.rsplit('#').next().unwrap_or(raw).to_string()
 }
 
 /// Extracts the text of the first `<tag>…</tag>` (good enough for AWS query responses).
@@ -391,6 +407,32 @@ mod tests {
             "{}",
             out[1].1
         );
+    }
+
+    #[test]
+    fn error_codes_from_header_or_body() {
+        let empty = serde_json::json!({});
+        assert_eq!(
+            error_code(
+                Some(
+                    "AlreadyExistsException:http://internal.amazon.com/coral/com.amazonaws.sesv2/"
+                ),
+                &empty
+            ),
+            "AlreadyExistsException"
+        );
+        assert_eq!(
+            error_code(
+                None,
+                &serde_json::json!({ "__type": "com.amazon.coral#NotFoundException" })
+            ),
+            "NotFoundException"
+        );
+        assert_eq!(
+            error_code(None, &serde_json::json!({ "code": "BadRequestException" })),
+            "BadRequestException"
+        );
+        assert_eq!(error_code(None, &empty), "Error");
     }
 
     #[test]

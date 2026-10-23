@@ -18,3 +18,10 @@ CREATE TABLE site_setups (
   state TEXT NOT NULL,             -- JSON: steps, created resources, errors
   updated_at TEXT NOT NULL
 );
+
+-- Instance-wide settings, e.g. a random installation id used to namespace cloud resources so
+-- several Listaculous installations can share one AWS account without colliding.
+CREATE TABLE settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);

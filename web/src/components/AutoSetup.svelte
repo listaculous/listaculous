@@ -57,16 +57,30 @@
     else if (pending) poll = setTimeout(refresh, 20000);
   }
 
+  // The plan shown is always for the exact selections it was requested with, and apply submits
+  // those same selections (not whatever the inputs say now).
+  let planReq = null;
+  let previewSeq = 0;
   async function preview() {
+    const req = body();
+    const n = ++previewSeq;
     busy = true;
     error = '';
     try {
-      plan = await api(`/sites/${site.id}/setup/plan`, { method: 'POST', body: body() });
+      const p = await api(`/sites/${site.id}/setup/plan`, { method: 'POST', body: req });
+      if (n === previewSeq) { plan = p; planReq = req; }
     } catch (err) {
-      error = err.message;
+      if (n === previewSeq) error = err.message;
     } finally {
-      busy = false;
+      if (n === previewSeq) busy = false;
     }
+  }
+
+  function selectionChanged() {
+    previewSeq++; // discard any in-flight preview
+    plan = null;
+    planReq = null;
+    busy = false;
   }
 
   async function applyNow() {
@@ -76,7 +90,7 @@
     busy = true;
     error = '';
     try {
-      setup = await api(`/sites/${site.id}/setup/apply`, { method: 'POST', body: { ...body(), confirm: true } });
+      setup = await api(`/sites/${site.id}/setup/apply`, { method: 'POST', body: { ...planReq, confirm: true } });
       refresh();
     } catch (err) {
       error = err.message;
@@ -85,11 +99,17 @@
     }
   }
 
-  // Tell the parent once a run finishes, so it reloads the site (provider changed to SES).
-  let notified = false;
+  // When a run finishes: tell the parent (the site now sends via SES) and re-plan, so the records
+  // shown include the real DKIM values (needed when adding DNS by hand).
+  // Only on a running → finished transition (not when the page opens on a finished run).
+  let lastStatus = null;
   $effect(() => {
-    if (setup.status === 'applied' && !notified) { notified = true; onApplied?.(); }
-    if (setup.status === 'running') notified = false;
+    const status = setup.status;
+    if (lastStatus === 'running' && (status === 'applied' || status === 'error')) {
+      if (status === 'applied') onApplied?.();
+      if (plan && planReq) preview();
+    }
+    lastStatus = status;
   });
 
   async function loadDraft() {
@@ -146,17 +166,17 @@
   {:else}
     <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin-bottom:4px">
       <label class="field">AWS account
-        <select bind:value={awsId} onchange={() => (plan = null)}>
+        <select bind:value={awsId} onchange={selectionChanged} disabled={busy}>
           {#each integrations.filter((i) => i.kind === 'aws') as i (i.id)}<option value={i.id}>{i.name}</option>{/each}
         </select>
       </label>
       <label class="field">DNS
-        <select bind:value={dnsId} onchange={() => (plan = null)}>
+        <select bind:value={dnsId} onchange={selectionChanged} disabled={busy}>
           {#each integrations.filter((i) => i.kind !== 'aws') as i (i.id)}<option value={String(i.id)}>{i.name}: add records automatically</option>{/each}
           <option value="">I'll add DNS records myself</option>
         </select>
       </label>
-      <label class="field">SES region <input bind:value={region} oninput={() => (plan = null)} placeholder="us-east-1" autocomplete="off" data-bwignore /></label>
+      <label class="field">SES region <input bind:value={region} oninput={selectionChanged} disabled={busy} placeholder="us-east-1" autocomplete="off" data-bwignore /></label>
     </div>
 
     {#if setup.status === 'running' || setup.status === 'applied' || setup.status === 'error'}

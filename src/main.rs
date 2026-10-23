@@ -61,6 +61,8 @@ pub struct AppState {
     pub auth_limiter: Arc<RateLimiter>,
     pub webauthn: Arc<webauthn_rs::Webauthn>,
     pub openapi: Arc<serde_json::Value>,
+    /// Random per-installation id (namespaces AWS resources).
+    pub instance_id: Arc<String>,
 }
 
 /// Fixed-window per-key rate limiter for public endpoints.
@@ -107,6 +109,8 @@ async fn main() -> anyhow::Result<()> {
     crypto::init(&cfg.database_url)?;
     let db = db::connect(&cfg.database_url).await?;
     crypto::migrate_plaintext(&db).await?;
+    let instance_id = db::instance_id(&db).await?;
+    setup::recover_interrupted(&db).await?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -118,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         auth_limiter: Arc::new(RateLimiter::new(10, Duration::from_secs(300))),
         webauthn: Arc::new(passkeys::build(&cfg.base_url)?),
         openapi: Arc::new(openapi::load(&cfg.base_url)?),
+        instance_id: Arc::new(instance_id),
     };
 
     tokio::spawn(worker::run(state.clone()));
