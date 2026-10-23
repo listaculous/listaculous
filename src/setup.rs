@@ -66,7 +66,7 @@ fn rel(name: &str, zone: &str) -> String {
     }
 }
 
-fn target(st: &AppState, site: Site) -> AppResult<Target> {
+fn target(st: &AppState, site: Site, region: &str) -> AppResult<Target> {
     let zone = site.domain.trim().to_ascii_lowercase();
     let identity = site
         .from_email
@@ -97,7 +97,12 @@ fn target(st: &AppState, site: Site) -> AppResult<Target> {
         // Namespaced by installation so several installs can share one AWS account.
         config_set: format!("listaculous-{}-site-{}", st.instance_id, site.id),
         topic: format!("listaculous-{}-site-{}-feedback", st.instance_id, site.id),
-        iam_user: format!("listaculous-{}-site-{}-sender", st.instance_id, site.id),
+        // One sender per region: re-running setup in another region never changes (or breaks)
+        // the permissions of the user the site may still be sending with.
+        iam_user: format!(
+            "listaculous-{}-site-{}-{region}-sender",
+            st.instance_id, site.id
+        ),
         zone,
         identity,
         webhook_url,
@@ -287,9 +292,10 @@ pub async fn plan(
     Path(id): Path<i64>,
     Json(req): Json<SetupRequest>,
 ) -> AppResult<Json<Value>> {
-    let t = target(&st, load_site(&st, &user, id).await?)?;
+    let site = load_site(&st, &user, id).await?;
     let aws_int = integrations::load(&st, &user, req.aws_integration_id).await?;
     let aws = aws_int.aws(&st.http, req.region.as_deref())?;
+    let t = target(&st, site, &aws.region)?;
     let dns_int = match req.dns_integration_id {
         Some(d) => Some(integrations::load(&st, &user, d).await?),
         None => None,
@@ -449,9 +455,10 @@ pub async fn apply(
             "review the plan first, then call apply with \"confirm\": true",
         ));
     }
-    let t = target(&st, load_site(&st, &user, id).await?)?;
+    let site = load_site(&st, &user, id).await?;
     let aws_int = integrations::load(&st, &user, req.aws_integration_id).await?;
     let aws = aws_int.aws(&st.http, req.region.as_deref())?;
+    let t = target(&st, site, &aws.region)?;
     let dns_int = match req.dns_integration_id {
         Some(d) => Some(integrations::load(&st, &user, d).await?),
         None => None,
@@ -887,23 +894,7 @@ async fn run(
         "configuration_set": t.config_set,
     });
     crate::crypto::seal_config(&mut cfg)?;
-    // Only switch the site if nobody changed its sender or provider while setup ran; otherwise
-    // we could replace newer credentials with a key scoped to the old domain.
-    let switched = sqlx::query(
-        "UPDATE sites SET provider_kind = 'ses', provider_config = $1 WHERE id = $2 \
-         AND from_email = $3 AND domain = $4 AND provider_kind = $5 AND provider_config = $6",
-    )
-    .bind(cfg.to_string())
-    .bind(site_id)
-    .bind(&t.site.from_email)
-    .bind(&t.site.domain)
-    .bind(&t.site.provider_kind)
-    .bind(&t.site.provider_config)
-    .execute(&st.db)
-    .await?;
-    if switched.rows_affected() == 0 {
-        anyhow::bail!("the site's sender or email provider settings changed while setup was running; review them and run setup again (the new key is kept and will be reused)");
-    }
+    switch_site_provider(&st.db, &t.site, run_id, &cfg).await?;
     state["resources"]["iam_user"] = t.iam_user.clone().into();
     state["resources"]["access_key_id"] = key_id.clone().into();
     state["resources"]["aws_account_id"] = account_id.clone().into();
@@ -921,6 +912,46 @@ async fn run(
         ),
     )
     .await?;
+    Ok(())
+}
+
+/// Points the site at the new SES credentials, as one transaction that first re-asserts this run
+/// still owns the setup (a row lock that a takeover's claim must wait for). Also refuses if the
+/// site's sender or provider settings changed since setup started, so newer credentials are never
+/// replaced with a key scoped to an old domain.
+async fn switch_site_provider(
+    db: &crate::db::Db,
+    site: &Site,
+    run_id: &str,
+    cfg: &Value,
+) -> anyhow::Result<()> {
+    let mut tx = db.begin().await?;
+    let owned =
+        sqlx::query("UPDATE site_setups SET updated_at = $1 WHERE site_id = $2 AND run_id = $3")
+            .bind(now())
+            .bind(site.id)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+    if owned.rows_affected() == 0 {
+        anyhow::bail!("this setup run was superseded by a newer one");
+    }
+    let switched = sqlx::query(
+        "UPDATE sites SET provider_kind = 'ses', provider_config = $1 WHERE id = $2 \
+         AND from_email = $3 AND domain = $4 AND provider_kind = $5 AND provider_config = $6",
+    )
+    .bind(cfg.to_string())
+    .bind(site.id)
+    .bind(&site.from_email)
+    .bind(&site.domain)
+    .bind(&site.provider_kind)
+    .bind(&site.provider_config)
+    .execute(&mut *tx)
+    .await?;
+    if switched.rows_affected() == 0 {
+        anyhow::bail!("the site's sender or email provider settings changed while setup was running; review them and run setup again (the new key is kept and will be reused)");
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1229,6 +1260,65 @@ mod tests {
         no_complaints["EventDestinations"][0]["MatchingEventTypes"] = json!(["BOUNCE"]);
         assert!(!destination_ok(&no_complaints, topic));
         assert!(!destination_ok(&good, "arn:aws:sns:us-east-1:1:other"));
+    }
+
+    #[tokio::test]
+    async fn final_switch_is_fenced_by_run_and_site_settings() {
+        let path = std::env::temp_dir().join(format!("lc-setup-{}.db", crate::db::random_token(8)));
+        let db = crate::db::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO accounts (name, created_at) VALUES ('a', 'now')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sites (account_id, name, domain, from_name, from_email, webhook_secret, created_at) \
+                     VALUES (1, 'S', 'example.com', 'F', 'hi@news.example.com', 'w', 'now')").execute(&db).await.unwrap();
+        let site: Site = sqlx::query_as(&format!("SELECT {SITE_COLS} FROM sites WHERE id = 1"))
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO site_setups (site_id, status, state, run_id, updated_at) VALUES (1, 'running', '{}', 'old', 'now')")
+            .execute(&db).await.unwrap();
+        let cfg = json!({ "region": "us-east-1" });
+
+        // A newer run took over: the old run must not switch the site.
+        sqlx::query("UPDATE site_setups SET run_id = 'new' WHERE site_id = 1")
+            .execute(&db)
+            .await
+            .unwrap();
+        let err = switch_site_provider(&db, &site, "old", &cfg)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("superseded"), "{err}");
+        let (kind,): (String,) = sqlx::query_as("SELECT provider_kind FROM sites WHERE id = 1")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(kind, "log");
+
+        // The owning run is refused if the site's settings changed meanwhile…
+        sqlx::query("UPDATE sites SET provider_kind = 'smtp' WHERE id = 1")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(switch_site_provider(&db, &site, "new", &cfg)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("changed"));
+        // …and succeeds when they're unchanged.
+        let site: Site = sqlx::query_as(&format!("SELECT {SITE_COLS} FROM sites WHERE id = 1"))
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        switch_site_provider(&db, &site, "new", &cfg).await.unwrap();
+        let (kind,): (String,) = sqlx::query_as("SELECT provider_kind FROM sites WHERE id = 1")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(kind, "ses");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

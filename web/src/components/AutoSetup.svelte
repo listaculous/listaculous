@@ -49,11 +49,17 @@
   }
   init();
 
+  let refreshSeq = 0;
   async function refresh() {
     clearTimeout(poll);
+    const n = ++refreshSeq;
+    const forAws = awsId;
     try {
-      const q = awsId ? `?aws_integration_id=${awsId}` : '';
-      setup = await api(`/sites/${site.id}/setup${q}`);
+      const q = forAws ? `?aws_integration_id=${forAws}` : '';
+      const r = await api(`/sites/${site.id}/setup${q}`);
+      // A slower response for a previously selected account must not overwrite the current one.
+      if (n !== refreshSeq || forAws !== awsId) return;
+      setup = r;
     } catch (err) {
       error = err.message;
     }
