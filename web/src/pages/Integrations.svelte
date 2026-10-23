@@ -6,6 +6,10 @@
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import ShieldCheck from '@lucide/svelte/icons/shield-check';
   import ExternalLink from '@lucide/svelte/icons/external-link';
+  import Terminal from '@lucide/svelte/icons/terminal';
+  import Download from '@lucide/svelte/icons/download';
+  import LoaderCircle from '@lucide/svelte/icons/loader-circle';
+  import { onDestroy } from 'svelte';
   import { api, fmtDate } from '../api.js';
   import Alert from '../components/Alert.svelte';
   import CodeBlock from '../components/CodeBlock.svelte';
@@ -14,6 +18,66 @@
 
   let items = $state([]);
   let policy = $state('');
+  let awsMode = $state('cli'); // 'cli' | 'console'
+  let cliRegion = $state('us-east-1');
+  let cliKey = $state(null); // temporary API key used by the one-liner
+  let script = $state('');
+  let showScript = $state(false);
+  let watch;
+  onDestroy(() => clearTimeout(watch));
+
+  // A short-lived API key just for the script, so it can connect the new AWS key by itself.
+  async function prepareCli() {
+    error = '';
+    try {
+      cliKey = await api('/auth/api-keys', { method: 'POST', body: { name: 'AWS CLI setup script', expires_in_days: 1 } });
+      watchForConnection(items.filter((i) => i.kind === 'aws').length);
+    } catch (err) {
+      error = err.message;
+    }
+  }
+
+  // Poll until the script has connected an AWS account, then revoke the temporary key.
+  function watchForConnection(before) {
+    clearTimeout(watch);
+    watch = setTimeout(async () => {
+      await load();
+      if (items.filter((i) => i.kind === 'aws').length > before) {
+        msg = 'AWS connected from the CLI. The temporary API key was revoked.';
+        await api(`/auth/api-keys/${cliKey.id}`, { method: 'DELETE' }).catch(() => {});
+        cliKey = null;
+        open = null;
+      } else {
+        watchForConnection(before);
+      }
+    }, 3000);
+  }
+
+  // Cancelling revokes the temporary script key right away (it would expire within a day anyway).
+  function cancelCli() {
+    clearTimeout(watch);
+    if (cliKey) api(`/auth/api-keys/${cliKey.id}`, { method: 'DELETE' }).catch(() => {});
+    cliKey = null;
+    open = null;
+  }
+  onDestroy(() => { if (cliKey) api(`/auth/api-keys/${cliKey.id}`, { method: 'DELETE' }).catch(() => {}); });
+
+  async function loadScript() {
+    script = await (await fetch(`/api/integrations/aws-setup-script?region=${encodeURIComponent(cliRegion)}`)).text();
+    showScript = true;
+  }
+
+  function downloadScript() {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([script], { type: 'text/x-shellscript' }));
+    a.download = 'listaculous-aws-setup.sh';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  let oneLiner = $derived(cliKey
+    ? `curl -fsSL -H "Authorization: Bearer ${cliKey.token}" "${location.origin}/api/integrations/aws-setup-script?region=${cliRegion}" \\\n  | LISTACULOUS_API_KEY=${cliKey.token} bash`
+    : '');
   let open = $state(null); // 'aws' | 'porkbun'
   let aws = $state({ access_key_id: '', secret_access_key: '', region: 'us-east-1' });
   let pork = $state({ api_key: '', secret_api_key: '' });
@@ -80,6 +144,41 @@
       </div>
     {/each}
     {#if open === 'aws'}
+      <div class="seg" style="margin:12px 0 4px">
+        <button class:active={awsMode === 'cli'} onclick={() => (awsMode = 'cli')}><Terminal size={13} /> AWS CLI</button>
+        <button class:active={awsMode === 'console'} onclick={() => (awsMode = 'console')}>AWS console</button>
+      </div>
+    {/if}
+    {#if open === 'aws' && awsMode === 'cli'}
+      <p class="small muted" style="margin:10px 0">Runs on your machine with your AWS CLI login (<code>aws sts get-caller-identity</code> should work). It creates the <code>listaculous-setup</code> IAM user with the exact policy below, makes an access key and connects it here. No console needed.</p>
+      <label class="field" style="max-width:220px">Default SES region <input bind:value={cliRegion} {...NOFILL} oninput={() => (showScript = false)} /></label>
+      {#if cliKey}
+        <div style="margin-bottom:10px"><CodeBlock code={oneLiner} /></div>
+        <p class="small muted" style="display:flex;gap:8px;align-items:center"><LoaderCircle size={14} class="spin" /> Waiting for the script to connect… It uses a temporary API key that expires in a day and is revoked as soon as AWS is connected.</p>
+      {:else}
+        <button onclick={prepareCli}><Terminal size={16} /> Get the setup command</button>
+      {/if}
+      <div class="actions" style="margin-top:12px">
+        <button class="link" onclick={() => (showScript ? (showScript = false) : loadScript())}>{showScript ? 'Hide the script' : 'View the script first'}</button>
+        {#if showScript}<button class="link" onclick={downloadScript}><Download size={13} /> Download</button>{/if}
+      </div>
+      {#if showScript}
+        <p class="small muted" style="margin:8px 0">Prefer to run it yourself? Download and run <code>bash listaculous-aws-setup.sh</code>; it prints the key to paste in below. Set <code>LISTACULOUS_API_KEY</code> to connect automatically, and <code>AWS_PROFILE</code> to choose a profile.</p>
+        <div style="max-height:360px;overflow:auto;margin-bottom:12px"><CodeBlock code={script} /></div>
+      {/if}
+      <details style="margin-top:8px">
+        <summary class="small">Paste a key manually</summary>
+        <form style="margin-top:10px" onsubmit={(e) => { e.preventDefault(); connect('aws'); }}>
+          <div class="grid-2">
+            <label class="field">Access key ID <input bind:value={aws.access_key_id} required {...NOFILL} placeholder="AKIA…" /></label>
+            <label class="field">Secret access key <input type="password" bind:value={aws.secret_access_key} required autocomplete="new-password" data-bwignore /></label>
+            <label class="field">Default SES region <input bind:value={aws.region} required {...NOFILL} placeholder="us-east-1" /></label>
+          </div>
+          <button disabled={busy}><Plug size={16} /> Connect AWS</button>
+        </form>
+      </details>
+      <div class="actions" style="margin-top:12px"><button type="button" class="ghost" onclick={cancelCli}>Cancel</button></div>
+    {:else if open === 'aws'}
       <ol class="steps small" style="margin:12px 0 16px">
         <li><div>In the AWS console, open <strong>IAM → Users → Create user</strong> (e.g. <code>listaculous-setup</code>). No console access needed.</div></li>
         <li><div style="min-width:0">Attach this as an <strong>inline policy</strong> (Permissions → Add permissions → Create inline policy → JSON):

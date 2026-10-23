@@ -176,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/integrations/{id}", delete(integrations::remove))
         .route("/integrations/aws-policy", get(integrations::aws_policy))
+        .route("/integrations/aws-setup-script", get(integrations::aws_script))
         .route("/sites/{id}/setup", get(setup::status))
         .route("/sites/{id}/setup/plan", post(setup::plan))
         .route("/sites/{id}/setup/apply", post(setup::apply))

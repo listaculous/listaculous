@@ -269,3 +269,46 @@ pub fn setup_policy() -> Value {
 pub async fn aws_policy(_user: AuthUser) -> Json<Value> {
     Json(setup_policy())
 }
+
+const AWS_SETUP_SCRIPT: &str = include_str!("scripts/aws-setup.sh");
+
+/// A bash script that creates the setup IAM user with the AWS CLI (policy embedded, so it always
+/// matches `setup_policy`), optionally connecting it to this server via an API key.
+pub fn aws_setup_script(base_url: &str, region: &str) -> String {
+    let region = if region.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !region.is_empty() { region } else { "us-east-1" };
+    AWS_SETUP_SCRIPT
+        .replace("__POLICY__", &serde_json::to_string_pretty(&setup_policy()).unwrap_or_default())
+        .replace("__URL__", base_url)
+        .replace("__REGION__", region)
+}
+
+#[derive(Deserialize, Default)]
+pub struct ScriptQuery {
+    #[serde(default)]
+    pub region: String,
+}
+
+pub async fn aws_script(
+    State(st): State<AppState>,
+    _user: AuthUser,
+    axum::extract::Query(q): axum::extract::Query<ScriptQuery>,
+) -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        aws_setup_script(&st.cfg.base_url, &q.region),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn script_embeds_current_policy_and_url() {
+        let s = super::aws_setup_script("https://lc.example.com", "eu-west-1");
+        assert!(!s.contains("__POLICY__") && !s.contains("__URL__") && !s.contains("__REGION__"));
+        assert!(s.contains(r#"LISTACULOUS_URL="https://lc.example.com""#));
+        assert!(s.contains("ses:CreateEmailIdentity") && s.contains("arn:aws:iam::*:user/listaculous/*"));
+        assert!(s.contains("${LISTACULOUS_SES_REGION:-eu-west-1}"));
+        // An unsafe region can't inject into the script.
+        assert!(super::aws_setup_script("https://x", "a\"; rm -rf /").contains(":-us-east-1}"));
+    }
+}

@@ -405,6 +405,26 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/Ok' }
         '404': { $ref: '#/components/responses/NotFound' }
+  /api/integrations/aws-setup-script:
+    get:
+      tags: [Integrations]
+      operationId: getAwsSetupScript
+      summary: AWS CLI script that creates the setup key
+      description: |
+        A bash script that uses the AWS CLI to create the `listaculous-setup` IAM user, attach the
+        setup policy and create an access key, so you never need the AWS console. With
+        `LISTACULOUS_API_KEY` set, it connects the key to this server itself:
+
+        ```sh
+        curl -fsSL -H "Authorization: Bearer $KEY" "$URL/api/integrations/aws-setup-script" \
+          | LISTACULOUS_API_KEY=$KEY bash
+        ```
+      parameters:
+        - { name: region, in: query, schema: { type: string, default: us-east-1 }, description: Default SES region written into the script. }
+      responses:
+        '200':
+          description: The script.
+          content: { text/x-shellscript: { schema: { type: string } } }
   /api/integrations/aws-policy:
     get:
       tags: [Integrations]

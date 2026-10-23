@@ -44,6 +44,8 @@ Connect AWS (and optionally Porkbun) under **Integrations**, then open a site â†
 
 It only ever *adds* DNS records, never edits or deletes them, and stops if one conflicts. Re-running it is safe. If your account is in the SES sandbox, Listaculous drafts a production access request for you to edit and submit.
 
+**No AWS console needed:** on the Integrations page choose **AWS CLI â†’ Get the setup command** and paste the one-liner into a terminal where the AWS CLI is signed in. It creates the `listaculous-setup` IAM user with the exact policy, makes an access key and connects it (using a temporary API key that's revoked once connected). Prefer to read it first? The script is also at `GET /api/integrations/aws-setup-script`; run it without `LISTACULOUS_API_KEY` and it prints the key to paste in.
+
 The AWS key you connect is only used for setup; the exact IAM policy it needs is shown on the Integrations page (and at `GET /api/integrations/aws-policy`). Once your sites are set up you can delete that key in AWS. Note that the setup policy can create IAM users under `/listaculous/`, so treat the key as sensitive.
 
 For Porkbun, create an API key and turn on **API Access** for each domain Listaculous should manage.
