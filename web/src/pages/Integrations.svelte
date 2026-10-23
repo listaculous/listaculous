@@ -118,6 +118,12 @@
     if (close) open = null;
     if (key) await revokeSetupKey(key);
   }
+  // Switching to another form ends any AWS CLI attempt (and revokes its key).
+  function openForm(kind) {
+    if (open === 'aws' && kind !== 'aws') cancelCli({ close: false });
+    open = kind;
+  }
+
   // Leaving the page abandons the attempt: revoke its key so the command can't be used later.
   // (A key still being created is revoked by prepareCli once the attempt no longer matches.)
   onDestroy(() => {
@@ -273,7 +279,7 @@
         <div class="actions"><button disabled={busy}><Plug size={16} /> Connect AWS</button><button type="button" class="ghost" onclick={() => cancelCli()}>Cancel</button></div>
       </form>
     {:else}
-      <button class="secondary" style="margin-top:8px" onclick={() => (open = 'aws')}><Plus size={16} /> Connect an AWS account</button>
+      <button class="secondary" style="margin-top:8px" onclick={() => openForm('aws')}><Plus size={16} /> Connect an AWS account</button>
     {/if}
   </div>
 
@@ -304,7 +310,7 @@
         <div class="actions"><button disabled={busy}><Plug size={16} /> Connect Porkbun</button><button type="button" class="ghost" onclick={() => (open = null)}>Cancel</button></div>
       </form>
     {:else}
-      <button class="secondary" style="margin-top:8px" onclick={() => (open = 'porkbun')}><Plus size={16} /> Connect Porkbun</button>
+      <button class="secondary" style="margin-top:8px" onclick={() => openForm('porkbun')}><Plus size={16} /> Connect Porkbun</button>
     {/if}
   </div>
 </div>

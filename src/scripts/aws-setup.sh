@@ -51,7 +51,8 @@ if [ -n "${LISTACULOUS_API_KEY:-}" ]; then
   BODY=$(printf '{"kind":"aws","config":{"access_key_id":"%s","secret_access_key":"%s","region":"%s"}}' "$KEY_ID" "$SECRET" "$REGION")
   # New IAM keys can take a few seconds to start working; Listaculous verifies the key, so retry.
   for _ in 1 2 3 4 5 6; do
-    if RESP=$(curl -fsS -X POST "$LISTACULOUS_URL/api/integrations" \
+    # Bounded, so an unresponsive server can't hang us before the key is printed below.
+    if RESP=$(curl -fsS --connect-timeout 10 --max-time 45 -X POST "$LISTACULOUS_URL/api/integrations" \
         -H "Authorization: Bearer $LISTACULOUS_API_KEY" -H "Content-Type: application/json" \
         --data-binary @- <<<"$BODY" 2>&1); then
       echo "Connected to Listaculous ($LISTACULOUS_URL). You can now run Automatic setup for a site."
