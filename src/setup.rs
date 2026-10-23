@@ -462,23 +462,26 @@ pub async fn apply(
         return Err(AppError::bad_request("some DNS records conflict with existing ones; resolve them (see the plan) and try again"));
     }
 
-    let mut state = load_state(&st, id)
-        .await?
-        .map(|(_, s, _)| s)
-        .unwrap_or_else(|| json!({}));
+    // Atomically claim the run first (one at a time per site; a "running" row that hasn't been
+    // touched within the lease is abandoned and can be taken over). Only then read the state, so
+    // we build on the latest saved resources rather than a snapshot another run may have updated.
     let run_id = crate::db::random_token(12);
-    state["plan"] = plan;
-    state["steps"] = json!({});
-    state["error"] = Value::Null;
-    state["started_at"] = now().into();
-    // Atomically claim the run: only one at a time per site. A "running" row that hasn't been
-    // touched for RUN_LEASE is considered abandoned and can be taken over.
-    if !claim_run(&st, id, &run_id, &state).await? {
+    if !claim_run(&st, id, &run_id).await? {
         return Err(AppError::new(
             axum::http::StatusCode::CONFLICT,
             "setup is already running for this site",
         ));
     }
+    let mut state = load_state(&st, id)
+        .await?
+        .map(|(_, s, _)| s)
+        .unwrap_or_else(|| json!({}));
+    state["plan"] = plan;
+    state["request"] = json!({ "aws_integration_id": req.aws_integration_id, "dns_integration_id": req.dns_integration_id, "region": aws.region });
+    state["steps"] = json!({});
+    state["error"] = Value::Null;
+    state["started_at"] = now().into();
+    save_state(&st, id, &run_id, "running", &state).await?;
 
     let st2 = st.clone();
     tokio::spawn(async move {
@@ -841,9 +844,12 @@ async fn run(
     // Reuse the key this setup already created for this IAM user in this AWS account (kept,
     // encrypted, in the run state); otherwise mint one and record it *immediately*, so an
     // interruption can't strand keys and use up the user's two key slots.
-    let saved = &state["resources"]["sender_key"];
-    let reusable = saved["iam_user"].as_str() == Some(t.iam_user.as_str())
-        && saved["aws_account_id"].as_str() == Some(account_id.as_str());
+    // Keys are kept per AWS account + IAM user, so switching accounts back and forth reuses them.
+    let key_slot = format!("{account_id}/{}", t.iam_user);
+    let saved = state["resources"]["sender_keys"][&key_slot].clone();
+    let reusable = saved["access_key_id"]
+        .as_str()
+        .is_some_and(|k| !k.is_empty());
     let (key_id, secret) = if reusable {
         (
             saved["access_key_id"]
@@ -864,7 +870,10 @@ async fn run(
             xml_tag(&xml, "AccessKeyId").ok_or_else(|| anyhow::anyhow!("no AccessKeyId"))?;
         let secret = xml_tag(&xml, "SecretAccessKey")
             .ok_or_else(|| anyhow::anyhow!("no SecretAccessKey"))?;
-        state["resources"]["sender_key"] = json!({
+        if !state["resources"]["sender_keys"].is_object() {
+            state["resources"]["sender_keys"] = json!({});
+        }
+        state["resources"]["sender_keys"][&key_slot] = json!({
             "iam_user": t.iam_user, "aws_account_id": account_id,
             "access_key_id": key_id, "secret_access_key": crate::crypto::encrypt(&secret)?,
         });
@@ -928,14 +937,14 @@ fn lease_cutoff() -> String {
 }
 
 /// Atomically claims the site's setup for a new run (one at a time, across server processes).
-async fn claim_run(st: &AppState, site_id: i64, run_id: &str, state: &Value) -> AppResult<bool> {
+async fn claim_run(st: &AppState, site_id: i64, run_id: &str) -> AppResult<bool> {
+    // Existing state is left untouched; only status/ownership change.
     let r = sqlx::query(
-        "INSERT INTO site_setups (site_id, status, state, run_id, updated_at) VALUES ($1, 'running', $2, $3, $4) \
-         ON CONFLICT (site_id) DO UPDATE SET status = 'running', state = excluded.state, run_id = excluded.run_id, updated_at = excluded.updated_at \
-         WHERE site_setups.status <> 'running' OR site_setups.updated_at < $5",
+        "INSERT INTO site_setups (site_id, status, state, run_id, updated_at) VALUES ($1, 'running', '{}', $2, $3) \
+         ON CONFLICT (site_id) DO UPDATE SET status = 'running', run_id = excluded.run_id, updated_at = excluded.updated_at \
+         WHERE site_setups.status <> 'running' OR site_setups.updated_at < $4",
     )
     .bind(site_id)
-    .bind(state.to_string())
     .bind(run_id)
     .bind(now())
     .bind(lease_cutoff())
@@ -989,6 +998,14 @@ async fn status_json(
     if status == "running" && updated_at < lease_cutoff() {
         status = "error".into();
         state["error"] = "interrupted (the server stopped mid-run); run setup again".into();
+    }
+    // Saved send-only keys stay server-side (even encrypted).
+    if let Some(keys) = state["resources"]["sender_keys"].as_object_mut() {
+        for k in keys.values_mut() {
+            if let Some(o) = k.as_object_mut() {
+                o.remove("secret_access_key");
+            }
+        }
     }
     let mut out = json!({ "status": status, "state": state });
     if verify {

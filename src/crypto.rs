@@ -158,12 +158,19 @@ pub async fn migrate_plaintext(db: &crate::db::Db) -> anyhow::Result<()> {
         let before = v.clone();
         seal_config(&mut v)?;
         if v != before {
-            sqlx::query("UPDATE sites SET provider_config = $1 WHERE id = $2")
-                .bind(v.to_string())
-                .bind(id)
-                .execute(db)
-                .await?;
-            tracing::info!("encrypted stored provider secrets for site {id}");
+            // Only if unchanged since we read it (another server may be editing it right now);
+            // a changed row is sealed by that save instead.
+            let r = sqlx::query(
+                "UPDATE sites SET provider_config = $1 WHERE id = $2 AND provider_config = $3",
+            )
+            .bind(v.to_string())
+            .bind(id)
+            .bind(&cfg)
+            .execute(db)
+            .await?;
+            if r.rows_affected() == 1 {
+                tracing::info!("encrypted stored provider secrets for site {id}");
+            }
         }
     }
     Ok(())

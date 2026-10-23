@@ -38,6 +38,13 @@
     awsId = firstAws?.id ?? null;
     dnsId = firstDns ? String(firstDns.id) : '';
     region = firstAws?.summary.region ?? '';
+    // Reopen with the accounts the last run used, so verification checks the right AWS account.
+    const last = (await api(`/sites/${site.id}/setup`)).state?.request;
+    if (last && integrations.some((i) => i.id === last.aws_integration_id)) {
+      awsId = last.aws_integration_id;
+      dnsId = last.dns_integration_id && integrations.some((i) => i.id === last.dns_integration_id) ? String(last.dns_integration_id) : '';
+      region = last.region ?? region;
+    }
     await refresh();
   }
   init();
@@ -81,6 +88,7 @@
     plan = null;
     planReq = null;
     busy = false;
+    refresh(); // verification is per AWS account
   }
 
   async function applyNow() {
