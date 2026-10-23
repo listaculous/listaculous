@@ -28,7 +28,33 @@ else
 fi
 
 POLICY_FILE=$(mktemp)
-trap 'rm -f "$POLICY_FILE"' EXIT
+KEY_ID=""
+SECRET=""
+HANDED_OFF=0
+print_credentials() {
+  cat <<OUT
+
+Paste these into Listaculous → Integrations → Connect an AWS account
+(the secret is shown only once):
+
+  Access key ID:      $KEY_ID
+  Secret access key:  $SECRET
+  Region:             $REGION
+
+Once your sites are set up you can delete this key:
+  aws iam delete-access-key --user-name $USER_NAME --access-key-id $KEY_ID
+OUT
+}
+# Whatever happens after the key exists (error, Ctrl-C), never lose its secret: print it unless
+# Listaculous confirmed it stored the key, or it was already printed.
+on_exit() {
+  # Ignore further Ctrl-C / TERM while cleaning up, so a second signal can't cut off the printout.
+  trap '' INT TERM
+  rm -f "$POLICY_FILE"
+  if [ -n "$KEY_ID" ] && [ "$HANDED_OFF" != 1 ]; then print_credentials; fi
+}
+trap on_exit EXIT
+trap 'exit 130' INT TERM
 cat > "$POLICY_FILE" <<'POLICY'
 __POLICY__
 POLICY
@@ -50,29 +76,26 @@ if [ -n "${LISTACULOUS_API_KEY:-}" ]; then
   # Key characters are [A-Za-z0-9/+], so they're safe to place in JSON as-is.
   BODY=$(printf '{"kind":"aws","config":{"access_key_id":"%s","secret_access_key":"%s","region":"%s"}}' "$KEY_ID" "$SECRET" "$REGION")
   # New IAM keys can take a few seconds to start working; Listaculous verifies the key, so retry.
+  # Success means exactly HTTP 201 with the created AWS integration (a redirect, say, is not).
   for _ in 1 2 3 4 5 6; do
-    # Bounded, so an unresponsive server can't hang us before the key is printed below.
-    if RESP=$(curl -fsS --connect-timeout 10 --max-time 45 -X POST "$LISTACULOUS_URL/api/integrations" \
+    RESP_FILE=$(mktemp)
+    # Bounded, so an unresponsive server can't hang us before the key is printed.
+    CODE=$(curl -sS --connect-timeout 10 --max-time 45 -o "$RESP_FILE" -w '%{http_code}' -X POST "$LISTACULOUS_URL/api/integrations" \
         -H "Authorization: Bearer $LISTACULOUS_API_KEY" -H "Content-Type: application/json" \
-        --data-binary @- <<<"$BODY" 2>&1); then
+        --data-binary @- <<<"$BODY" 2>/dev/null) || CODE=000
+    RESP=$(cat "$RESP_FILE"); rm -f "$RESP_FILE"
+    if [ "$CODE" = 201 ] && grep -q '"kind":"aws"' <<<"$RESP"; then
+      HANDED_OFF=1
       echo "Connected to Listaculous ($LISTACULOUS_URL). You can now run Automatic setup for a site."
       exit 0
     fi
+    # The setup key is single-use: if it's gone (used/revoked/expired) retrying can't help.
+    case "$CODE" in 401|403|409) break ;; esac
     sleep 5
   done
-  echo "Couldn't connect automatically: $RESP" >&2
+  echo "Couldn't connect automatically (HTTP $CODE): $RESP" >&2
   echo "Paste the key below into Listaculous → Integrations → Connect an AWS account." >&2
 fi
 
-cat <<OUT
-
-Paste these into Listaculous → Integrations → Connect an AWS account
-(the secret is shown only once):
-
-  Access key ID:      $KEY_ID
-  Secret access key:  $SECRET
-  Region:             $REGION
-
-Once your sites are set up you can delete this key:
-  aws iam delete-access-key --user-name $USER_NAME --access-key-id $KEY_ID
-OUT
+print_credentials
+HANDED_OFF=1

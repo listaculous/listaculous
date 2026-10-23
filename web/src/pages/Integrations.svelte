@@ -132,13 +132,20 @@
     if (key) api(`/auth/api-keys/${key.id}`, { method: 'DELETE' }).catch(() => {});
   });
 
+  // Only the latest request, for the region still shown, may display the script.
+  let scriptSeq = 0;
   async function loadScript() {
+    const n = ++scriptSeq;
+    const region = cliRegion;
     try {
-      const res = await fetch(`/api/integrations/aws-setup-script?region=${encodeURIComponent(cliRegion)}`);
+      const res = await fetch(`/api/integrations/aws-setup-script?region=${encodeURIComponent(region)}`);
       if (!res.ok) throw new Error(res.status === 401 ? 'your session expired; sign in again' : `HTTP ${res.status}`);
-      script = await res.text();
+      const text = await res.text();
+      if (n !== scriptSeq || region !== cliRegion) return;
+      script = text;
       showScript = true;
     } catch (err) {
+      if (n !== scriptSeq) return;
       showScript = false;
       script = '';
       error = `Couldn't load the setup script: ${err.message}`;
@@ -232,7 +239,7 @@
     {/if}
     {#if open === 'aws' && awsMode === 'cli'}
       <p class="small muted" style="margin:10px 0">Runs on your machine with your AWS CLI login (<code>aws sts get-caller-identity</code> should work). It creates the <code>listaculous-setup</code> IAM user with the exact policy below, makes an access key and connects it here. No console needed.</p>
-      <label class="field" style="max-width:220px">Default SES region <input bind:value={cliRegion} {...NOFILL} oninput={() => (showScript = false)} aria-invalid={!regionOk} /></label>
+      <label class="field" style="max-width:220px">Default SES region <input bind:value={cliRegion} {...NOFILL} oninput={() => { showScript = false; scriptSeq++; }} aria-invalid={!regionOk} /></label>
       {#if !regionOk}<p class="small" style="color:var(--danger);margin:-8px 0 12px">Enter an AWS region like <code>us-east-1</code>.</p>{/if}
       {#if cliKey && regionOk}
         <div style="margin-bottom:10px"><CodeBlock code={oneLiner} /></div>
