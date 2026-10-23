@@ -74,6 +74,26 @@ pub async fn instance_id(db: &Db) -> anyhow::Result<String> {
     Ok(id)
 }
 
+/// Writes a consistent snapshot of a live SQLite database (committed WAL contents included).
+pub async fn backup(url: &str, out: &str) -> anyhow::Result<()> {
+    if !url.starts_with("sqlite:") {
+        anyhow::bail!("backup is for SQLite; use pg_dump for Postgres");
+    }
+    if std::path::Path::new(out).exists() {
+        anyhow::bail!("{out} already exists");
+    }
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(url)
+        .await?;
+    sqlx::query("VACUUM INTO $1")
+        .bind(out)
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }

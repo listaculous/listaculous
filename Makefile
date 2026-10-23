@@ -94,20 +94,21 @@ wait: ## Wait until the server answers its health check
 .PHONY: backup
 backup: ## Back up the SQLite database AND its encryption key into ./backups
 	@mkdir -p backups
-	@$(COMPOSE) exec -T $(SERVICE) sh -c 'cat /data/listaculous.db' > $(BACKUP)
+	@# VACUUM INTO makes a consistent copy of the live database (including the WAL).
+	@$(COMPOSE) exec -T $(SERVICE) sh -c 'rm -f /data/.backup.db && listaculous backup /data/.backup.db && cat /data/.backup.db && rm -f /data/.backup.db' > $(BACKUP)
 	@# Stored secrets (SES/SMTP/AWS/Porkbun keys) are encrypted with this key; a backup without it
 	@# can't decrypt them. (Not needed if you set LISTACULOUS_SECRET_KEY yourself.)
 	@$(COMPOSE) exec -T $(SERVICE) sh -c 'cat /data/secret.key 2>/dev/null' > $(BACKUP).key; \
 	if [ -s $(BACKUP).key ]; then chmod 600 $(BACKUP).key; \
 	  printf "$(G)✔ Saved $(BACKUP) + .key$(N) (keep the .key private; restore both with make restore FILE=$(BACKUP))\n"; \
 	else rm -f $(BACKUP).key; printf "$(G)✔ Saved $(BACKUP)$(N)\n"; fi
-	@printf "  Tip: stop the container first for a fully consistent copy.\n"
 
 .PHONY: restore
 restore: ## Restore a backup made by `make backup` (FILE=backups/….db); replaces current data
 	@test -n "$(FILE)" -a -f "$(FILE)" || { printf "$(R)✘ usage: make restore FILE=backups/listaculous-….db$(N)\n"; exit 1; }
 	@read -p "Replace the current database with $(FILE)? Type 'yes': " a; [ "$$a" = "yes" ] || { echo Aborted.; exit 1; }
 	@$(COMPOSE) stop $(SERVICE)
+	@# The service is stopped, so the old WAL can be discarded: the backup is a complete database.
 	@$(COMPOSE) run --rm -T --no-deps --entrypoint sh $(SERVICE) -c 'cat > /data/listaculous.db && rm -f /data/listaculous.db-wal /data/listaculous.db-shm' < $(FILE)
 	@if [ -f "$(FILE).key" ]; then $(COMPOSE) run --rm -T --no-deps --entrypoint sh $(SERVICE) -c 'cat > /data/secret.key && chmod 600 /data/secret.key' < $(FILE).key; fi
 	@$(COMPOSE) up -d $(SERVICE)

@@ -106,6 +106,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Arc::new(Config::from_env());
+    // `listaculous backup <file>`: consistent online copy of the SQLite database (includes WAL).
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("backup") {
+        let out = args
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("usage: listaculous backup <output.db>"))?;
+        return db::backup(&cfg.database_url, out).await;
+    }
     crypto::init(&cfg.database_url)?;
     let db = db::connect(&cfg.database_url).await?;
     crypto::migrate_plaintext(&db).await?;
