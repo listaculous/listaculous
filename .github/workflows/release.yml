@@ -29,6 +29,8 @@ jobs:
   # would just queue, so this has to be decided before the build job starts.) Without the
   # RUNNER_STATUS_TOKEN secret it falls back to "any listaculous runner".
   pick-runner:
+    # Manual runs can pick any branch; only main may publish the production tags.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:
@@ -51,6 +53,7 @@ jobs:
 
   build:
     needs: pick-runner
+    if: github.ref == 'refs/heads/main'
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.labels) }}
     timeout-minutes: 30
     steps:

@@ -21,14 +21,13 @@ COPY web/ ./
 RUN npm run build
 
 # ---- deps (arch-independent, so BuildKit runs it once for all platforms) ----
-# Downloads and unpacks every crate into the shared registry cache, holding a lock so parallel
-# platform builds never unpack into it at the same time.
+# Fetches every crate into an ordinary image layer (not a cache mount): it's rebuilt only when
+# Cargo.lock changes, can't be garbage-collected out from under a cached layer, and the per-arch
+# builds below read it concurrently without racing.
 FROM --platform=$BUILDPLATFORM ${ZIGBUILD_IMAGE} AS deps
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-RUN --mount=type=cache,id=lc-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=lc-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    mkdir -p src && echo 'fn main() {}' > src/main.rs && cargo fetch --locked
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && cargo fetch --locked && rm -rf src
 
 # ---- server (cross-compiled for the target platform) ----
 FROM deps AS server
@@ -36,11 +35,9 @@ ARG TARGETARCH
 COPY src ./src
 COPY migrations ./migrations
 COPY openapi.yaml ./openapi.yaml
-# The registry is only read here (offline), so the per-arch builds can share it concurrently;
-# each arch has its own target dir cache.
-RUN --mount=type=cache,id=lc-cargo-registry,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,id=lc-cargo-git,target=/usr/local/cargo/git,sharing=shared \
-    --mount=type=cache,id=lc-target-${TARGETARCH},target=/src/target \
+# Dependencies come from the deps layer (offline); each arch keeps its own target-dir cache, so
+# only changed code recompiles.
+RUN --mount=type=cache,id=lc-target-${TARGETARCH},target=/src/target \
     set -eu; \
     case "$TARGETARCH" in \
       amd64) TRIPLE=x86_64-unknown-linux-musl ;; \

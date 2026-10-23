@@ -13,8 +13,10 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      # Behind a reverse proxy on the same host, keep it private: "127.0.0.1:8080:8080".
-      - "8080:8080"
+      # Only reachable from this host, for a reverse proxy here (see Caddyfile). .env trusts
+      # X-Forwarded-For, which is only safe if clients can't bypass the proxy. To expose it
+      # directly instead, use "8080:8080" AND set TRUST_PROXY=false.
+      - "127.0.0.1:8080:8080"
     volumes:
       - listaculous-data:/data
     mem_limit: 128m
