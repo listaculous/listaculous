@@ -60,17 +60,6 @@ pub fn scope_allows(scope: &str, method: &axum::http::Method, path: &str) -> boo
     }
 }
 
-/// Deletes a single-use key once it has done its job.
-pub async fn consume(st: &AppState, user: &AuthUser) -> AppResult<()> {
-    if let (Some(id), SCOPE_AWS_SETUP) = (user.api_key_id, user.scope.as_str()) {
-        sqlx::query("DELETE FROM api_keys WHERE id = $1")
-            .bind(id)
-            .execute(&st.db)
-            .await?;
-    }
-    Ok(())
-}
-
 pub async fn list(State(st): State<AppState>, user: AuthUser) -> AppResult<Json<Value>> {
     user.require_session()?;
     let rows: Vec<(i64, String, String, String, Option<String>, Option<String>, String)> = sqlx::query_as(

@@ -33,16 +33,27 @@
   let preparing = $state(false);
   let watchNote = $state('');
 
+  const REGION_RE = /^[a-z]{2}(-[a-z]+)+-\d$/;
+  let regionOk = $derived(REGION_RE.test(cliRegion));
+
+  async function revokeSetupKey(key) {
+    try {
+      await api(`/auth/api-keys/${key.id}`, { method: 'DELETE' });
+    } catch (err) {
+      error = `Couldn't revoke setup key ${key.prefix}… (${err.message}). Revoke it under Account → API keys, or let it expire within a day; it can only connect an AWS account.`;
+    }
+  }
+
   async function prepareCli() {
-    if (preparing || cliKey) return;
+    if (preparing || cliKey || !regionOk) return;
     preparing = true;
     error = '';
     const mine = ++attempt;
     try {
       const key = await api('/auth/api-keys', { method: 'POST', body: { name: 'AWS CLI setup script', scope: 'aws_setup' } });
       if (mine !== attempt) {
-        // Cancelled while creating: don't leave it around.
-        api(`/auth/api-keys/${key.id}`, { method: 'DELETE' }).catch(() => {});
+        // Cancelled while creating: don't leave it around (and say so if that fails).
+        await revokeSetupKey(key);
         return;
       }
       cliKey = key;
@@ -63,12 +74,18 @@
         if (mine !== attempt) return;
         watchNote = '';
         if (!keys.some((k) => k.id === cliKey.id)) {
-          // The server consumed the key: the script connected an AWS account.
-          attempt++;
-          cliKey = null;
-          open = null;
-          msg = 'AWS connected from the CLI.';
+          // The key is gone. It was either consumed by a successful connect (the integration
+          // records which setup key created it) or revoked elsewhere.
+          const keyId = cliKey.id;
           await load();
+          if (mine !== attempt) return;
+          endCli();
+          if (items.some((i) => i.details?.setup_key_id === keyId)) {
+            msg = 'AWS connected from the CLI.';
+            if (open === 'aws') open = null;
+          } else {
+            error = 'The setup key was revoked before an AWS account was connected. Get a new setup command to try again.';
+          }
           return;
         }
       } catch (err) {
@@ -79,21 +96,21 @@
     }, 3000);
   }
 
-  // Cancelling revokes the setup key right away; if that fails we say so (it still can only
-  // connect an AWS account, and expires within a day).
-  async function cancelCli() {
+  // Ends the current CLI attempt (stops polling, forgets its command) without revoking.
+  function endCli() {
     attempt++;
     clearTimeout(watch);
-    const key = cliKey;
     cliKey = null;
-    open = null;
-    if (key) {
-      try {
-        await api(`/auth/api-keys/${key.id}`, { method: 'DELETE' });
-      } catch (err) {
-        error = `Couldn't revoke the setup key (${err.message}). Revoke "AWS CLI setup script" under Account → API keys, or let it expire within a day.`;
-      }
-    }
+    watchNote = '';
+  }
+
+  // Every way out of the AWS form (Cancel on either tab, connecting manually) comes through here:
+  // it ends the attempt and revokes an unused setup key, reporting failures.
+  async function cancelCli({ close = true } = {}) {
+    const key = cliKey;
+    endCli();
+    if (close) open = null;
+    if (key) await revokeSetupKey(key);
   }
   onDestroy(() => { attempt++; });
 
@@ -111,7 +128,7 @@
   }
 
   let oneLiner = $derived(cliKey
-    ? `curl -fsSL -H "Authorization: Bearer ${cliKey.token}" "${location.origin}/api/integrations/aws-setup-script?region=${cliRegion}" \\\n  | LISTACULOUS_API_KEY=${cliKey.token} bash`
+    ? `curl -fsSL -H "Authorization: Bearer ${cliKey.token}" "${location.origin}/api/integrations/aws-setup-script?region=${encodeURIComponent(cliRegion)}" \\\n  | LISTACULOUS_API_KEY=${cliKey.token} bash`
     : '');
   let open = $state(null); // 'aws' | 'porkbun'
   let aws = $state({ access_key_id: '', secret_access_key: '', region: 'us-east-1' });
@@ -132,6 +149,8 @@
     try {
       const config = kind === 'aws' ? $state.snapshot(aws) : $state.snapshot(pork);
       const r = await api('/integrations', { method: 'POST', body: { kind, config } });
+      // Connected by hand: any pending CLI attempt is no longer needed.
+      if (kind === 'aws') await cancelCli({ close: false });
       msg = `Connected ${r.name}.`;
       open = null;
       aws = { access_key_id: '', secret_access_key: '', region: 'us-east-1' };
@@ -186,16 +205,17 @@
     {/if}
     {#if open === 'aws' && awsMode === 'cli'}
       <p class="small muted" style="margin:10px 0">Runs on your machine with your AWS CLI login (<code>aws sts get-caller-identity</code> should work). It creates the <code>listaculous-setup</code> IAM user with the exact policy below, makes an access key and connects it here. No console needed.</p>
-      <label class="field" style="max-width:220px">Default SES region <input bind:value={cliRegion} {...NOFILL} oninput={() => (showScript = false)} /></label>
-      {#if cliKey}
+      <label class="field" style="max-width:220px">Default SES region <input bind:value={cliRegion} {...NOFILL} oninput={() => (showScript = false)} aria-invalid={!regionOk} /></label>
+      {#if !regionOk}<p class="small" style="color:var(--danger);margin:-8px 0 12px">Enter an AWS region like <code>us-east-1</code>.</p>{/if}
+      {#if cliKey && regionOk}
         <div style="margin-bottom:10px"><CodeBlock code={oneLiner} /></div>
         <p class="small muted" style="display:flex;gap:8px;align-items:center"><LoaderCircle size={14} class="spin" /> Waiting for the script to connect… Its single-use key can only connect an AWS account, expires in a day, and is deleted as soon as AWS is connected.</p>
         {#if watchNote}<p class="small muted">{watchNote}</p>{/if}
       {:else}
-        <button onclick={prepareCli} disabled={preparing}><Terminal size={16} /> Get the setup command</button>
+        <button onclick={prepareCli} disabled={preparing || !regionOk}><Terminal size={16} /> Get the setup command</button>
       {/if}
       <div class="actions" style="margin-top:12px">
-        <button class="link" onclick={() => (showScript ? (showScript = false) : loadScript())}>{showScript ? 'Hide the script' : 'View the script first'}</button>
+        <button class="link" disabled={!regionOk} onclick={() => (showScript ? (showScript = false) : loadScript())}>{showScript ? 'Hide the script' : 'View the script first'}</button>
         {#if showScript}<button class="link" onclick={downloadScript}><Download size={13} /> Download</button>{/if}
       </div>
       {#if showScript}
@@ -229,7 +249,7 @@
         </div>
         <p class="muted small" style="display:flex;gap:8px"><ShieldCheck size={15} style="flex-shrink:0;margin-top:2px" />
           <span>The key is checked with AWS and stored encrypted. It's only used to set things up; you can delete it in AWS once your sites are configured. Sending uses separate send-only keys.</span></p>
-        <div class="actions"><button disabled={busy}><Plug size={16} /> Connect AWS</button><button type="button" class="ghost" onclick={() => (open = null)}>Cancel</button></div>
+        <div class="actions"><button disabled={busy}><Plug size={16} /> Connect AWS</button><button type="button" class="ghost" onclick={() => cancelCli()}>Cancel</button></div>
       </form>
     {:else}
       <button class="secondary" style="margin-top:8px" onclick={() => (open = 'aws')}><Plus size={16} /> Connect an AWS account</button>
