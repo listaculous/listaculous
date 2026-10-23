@@ -7,11 +7,13 @@ mod db;
 mod dns;
 mod error;
 mod favicon;
+mod integrations;
 mod mailer;
 mod models;
 mod openapi;
 mod passkeys;
 mod public;
+mod setup;
 mod worker;
 
 use std::collections::HashMap;
@@ -156,6 +158,19 @@ async fn main() -> anyhow::Result<()> {
                 .delete(api::delete_site),
         )
         .route("/sites/{id}/test", post(api::test_site))
+        .route(
+            "/integrations",
+            get(integrations::list).post(integrations::create),
+        )
+        .route("/integrations/{id}", delete(integrations::remove))
+        .route("/integrations/aws-policy", get(integrations::aws_policy))
+        .route("/sites/{id}/setup", get(setup::status))
+        .route("/sites/{id}/setup/plan", post(setup::plan))
+        .route("/sites/{id}/setup/apply", post(setup::apply))
+        .route(
+            "/sites/{id}/setup/production-access",
+            get(setup::production_access_draft).post(setup::request_production_access),
+        )
         .route("/sites/{id}/icon", get(favicon::get_icon))
         .route("/sites/{id}/icon/refresh", post(favicon::refresh_icon))
         .route(
