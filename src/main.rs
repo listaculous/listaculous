@@ -1,14 +1,19 @@
 mod api;
 mod api_keys;
 mod auth;
+mod aws;
+mod crypto;
 mod db;
+mod dns;
 mod error;
 mod favicon;
+mod integrations;
 mod mailer;
 mod models;
 mod openapi;
 mod passkeys;
 mod public;
+mod setup;
 mod worker;
 
 use std::collections::HashMap;
@@ -56,6 +61,8 @@ pub struct AppState {
     pub auth_limiter: Arc<RateLimiter>,
     pub webauthn: Arc<webauthn_rs::Webauthn>,
     pub openapi: Arc<serde_json::Value>,
+    /// Random per-installation id (namespaces AWS resources).
+    pub instance_id: Arc<String>,
 }
 
 /// Fixed-window per-key rate limiter for public endpoints.
@@ -99,7 +106,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Arc::new(Config::from_env());
+    // `listaculous backup <file>`: consistent online copy of the SQLite database (includes WAL).
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("backup") {
+        let out = args
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("usage: listaculous backup <output.db>"))?;
+        return db::backup(&cfg.database_url, out).await;
+    }
+    crypto::init(&cfg.database_url)?;
     let db = db::connect(&cfg.database_url).await?;
+    crypto::migrate_plaintext(&db).await?;
+    let instance_id = db::instance_id(&db).await?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -111,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         auth_limiter: Arc::new(RateLimiter::new(10, Duration::from_secs(300))),
         webauthn: Arc::new(passkeys::build(&cfg.base_url)?),
         openapi: Arc::new(openapi::load(&cfg.base_url)?),
+        instance_id: Arc::new(instance_id),
     };
 
     tokio::spawn(worker::run(state.clone()));
@@ -151,6 +170,19 @@ async fn main() -> anyhow::Result<()> {
                 .delete(api::delete_site),
         )
         .route("/sites/{id}/test", post(api::test_site))
+        .route(
+            "/integrations",
+            get(integrations::list).post(integrations::create),
+        )
+        .route("/integrations/{id}", delete(integrations::remove))
+        .route("/integrations/aws-policy", get(integrations::aws_policy))
+        .route("/sites/{id}/setup", get(setup::status))
+        .route("/sites/{id}/setup/plan", post(setup::plan))
+        .route("/sites/{id}/setup/apply", post(setup::apply))
+        .route(
+            "/sites/{id}/setup/production-access",
+            get(setup::production_access_draft).post(setup::request_production_access),
+        )
         .route("/sites/{id}/icon", get(favicon::get_icon))
         .route("/sites/{id}/icon/refresh", post(favicon::refresh_icon))
         .route(

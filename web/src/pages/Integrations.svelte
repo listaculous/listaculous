@@ -1,0 +1,139 @@
+<script>
+  import Cloud from '@lucide/svelte/icons/cloud';
+  import Globe from '@lucide/svelte/icons/globe';
+  import Plug from '@lucide/svelte/icons/plug';
+  import Plus from '@lucide/svelte/icons/plus';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
+  import ShieldCheck from '@lucide/svelte/icons/shield-check';
+  import ExternalLink from '@lucide/svelte/icons/external-link';
+  import { api, fmtDate } from '../api.js';
+  import Alert from '../components/Alert.svelte';
+  import CodeBlock from '../components/CodeBlock.svelte';
+
+  const NOFILL = { autocomplete: 'off', 'data-bwignore': '', 'data-1p-ignore': '', 'data-lpignore': 'true' };
+
+  let items = $state([]);
+  let policy = $state('');
+  let open = $state(null); // 'aws' | 'porkbun'
+  let aws = $state({ access_key_id: '', secret_access_key: '', region: 'us-east-1' });
+  let pork = $state({ api_key: '', secret_api_key: '' });
+  let busy = $state(false);
+  let msg = $state('');
+  let error = $state('');
+
+  async function load() {
+    items = await api('/integrations');
+  }
+  load();
+  api('/integrations/aws-policy').then((p) => (policy = JSON.stringify(p, null, 2)));
+
+  async function connect(kind) {
+    busy = true;
+    msg = error = '';
+    try {
+      const config = kind === 'aws' ? $state.snapshot(aws) : $state.snapshot(pork);
+      const r = await api('/integrations', { method: 'POST', body: { kind, config } });
+      msg = `Connected ${r.name}.`;
+      open = null;
+      aws = { access_key_id: '', secret_access_key: '', region: 'us-east-1' };
+      pork = { api_key: '', secret_api_key: '' };
+      load();
+    } catch (err) {
+      error = err.message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function remove(i) {
+    if (!confirm(`Disconnect ${i.name}? Sites already set up keep sending; you just can't run setup with it.`)) return;
+    await api(`/integrations/${i.id}`, { method: 'DELETE' });
+    load();
+  }
+
+  let awsItems = $derived(items.filter((i) => i.kind === 'aws'));
+  let dnsItems = $derived(items.filter((i) => i.kind !== 'aws'));
+</script>
+
+<div class="page-head">
+  <div>
+    <h1>Integrations</h1>
+    <p class="sub">Connect Amazon Web Services and your DNS host, and Listaculous can set up sending for a site automatically: SES, DKIM, SPF, DMARC and bounce handling.</p>
+  </div>
+</div>
+
+{#if msg}<Alert kind="ok">{msg}</Alert>{/if}
+{#if error}<Alert kind="error">{error}</Alert>{/if}
+
+<div class="grid-2">
+  <div class="card">
+    <div class="card-head">
+      <div style="display:flex;gap:12px;align-items:center">
+        <div class="stat-icon" style="margin:0"><Cloud size={19} /></div>
+        <div><h2>Amazon Web Services</h2><p class="muted small">Used to set up SES. Each site then gets its own send-only key.</p></div>
+      </div>
+    </div>
+    {#each awsItems as i (i.id)}
+      <div class="li-row">
+        <div><div class="cell-strong">{i.name}</div><div class="small muted">{i.summary.access_key_id} · {i.summary.region} · added {fmtDate(i.created_at)}</div></div>
+        <button class="link danger-text" onclick={() => remove(i)} aria-label="Disconnect"><Trash2 size={15} /></button>
+      </div>
+    {/each}
+    {#if open === 'aws'}
+      <ol class="steps small" style="margin:12px 0 16px">
+        <li><div>In the AWS console, open <strong>IAM → Users → Create user</strong> (e.g. <code>listaculous-setup</code>). No console access needed.</div></li>
+        <li><div style="min-width:0">Attach this as an <strong>inline policy</strong> (Permissions → Add permissions → Create inline policy → JSON):
+          <div style="margin-top:8px"><CodeBlock code={policy} /></div></div></li>
+        <li><div>Create an <strong>access key</strong> for the user (use case: "Application running outside AWS") and paste it below.</div></li>
+      </ol>
+      <form onsubmit={(e) => { e.preventDefault(); connect('aws'); }}>
+        <div class="grid-2">
+          <label class="field">Access key ID <input bind:value={aws.access_key_id} required {...NOFILL} placeholder="AKIA…" /></label>
+          <label class="field">Secret access key <input type="password" bind:value={aws.secret_access_key} required autocomplete="new-password" data-bwignore /></label>
+          <label class="field">Default SES region <input bind:value={aws.region} required {...NOFILL} placeholder="us-east-1" /></label>
+        </div>
+        <p class="muted small" style="display:flex;gap:8px"><ShieldCheck size={15} style="flex-shrink:0;margin-top:2px" />
+          <span>The key is checked with AWS and stored encrypted. It's only used to set things up; you can delete it in AWS once your sites are configured. Sending uses separate send-only keys.</span></p>
+        <div class="actions"><button disabled={busy}><Plug size={16} /> Connect AWS</button><button type="button" class="ghost" onclick={() => (open = null)}>Cancel</button></div>
+      </form>
+    {:else}
+      <button class="secondary" style="margin-top:8px" onclick={() => (open = 'aws')}><Plus size={16} /> Connect an AWS account</button>
+    {/if}
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div style="display:flex;gap:12px;align-items:center">
+        <div class="stat-icon" style="margin:0"><Globe size={19} /></div>
+        <div><h2>DNS: Porkbun</h2><p class="muted small">Optional. Without it, setup lists the DNS records for you to add yourself.</p></div>
+      </div>
+    </div>
+    {#each dnsItems as i (i.id)}
+      <div class="li-row">
+        <div><div class="cell-strong">{i.name}</div><div class="small muted">added {fmtDate(i.created_at)}</div></div>
+        <button class="link danger-text" onclick={() => remove(i)} aria-label="Disconnect"><Trash2 size={15} /></button>
+      </div>
+    {/each}
+    {#if open === 'porkbun'}
+      <ol class="steps small" style="margin:12px 0 16px">
+        <li><div>Create an API key at <a href="https://porkbun.com/account/api" target="_blank" rel="noopener">porkbun.com/account/api <ExternalLink size={12} /></a>.</div></li>
+        <li><div>For each domain Listaculous should manage: <strong>Domain Management → your domain → Details → API Access → on</strong>. Other domains stay untouched.</div></li>
+      </ol>
+      <form onsubmit={(e) => { e.preventDefault(); connect('porkbun'); }}>
+        <div class="grid-2">
+          <label class="field">API key <input type="password" bind:value={pork.api_key} required autocomplete="new-password" data-bwignore placeholder="pk1_…" /></label>
+          <label class="field">Secret API key <input type="password" bind:value={pork.secret_api_key} required autocomplete="new-password" data-bwignore placeholder="sk1_…" /></label>
+        </div>
+        <p class="muted small">Listaculous only ever <strong>adds</strong> the records it needs, and never edits or deletes your existing DNS records.</p>
+        <div class="actions"><button disabled={busy}><Plug size={16} /> Connect Porkbun</button><button type="button" class="ghost" onclick={() => (open = null)}>Cancel</button></div>
+      </form>
+    {:else}
+      <button class="secondary" style="margin-top:8px" onclick={() => (open = 'porkbun')}><Plus size={16} /> Connect Porkbun</button>
+    {/if}
+  </div>
+</div>
+
+<div class="card">
+  <h2>Next</h2>
+  <p class="muted small" style="margin:4px 0 0">Open a site and go to <strong>Deliverability → Automatic setup</strong>. You'll see every change before anything happens.</p>
+</div>

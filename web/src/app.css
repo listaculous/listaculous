@@ -226,6 +226,16 @@ pre.code { background: var(--bg-sunken); border: 1px solid var(--border); paddin
 .fade-in { animation: fadein .25s ease; }
 @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
+/* ---------- Integrations & setup ---------- */
+.li-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid var(--border); }
+.setup-steps { display: flex; flex-direction: column; gap: 10px; margin: 6px 0 16px; }
+.setup-step { display: flex; gap: 10px; align-items: flex-start; }
+.setup-step > svg { flex-shrink: 0; margin-top: 2px; color: var(--muted); }
+.setup-step.done > svg { color: var(--ok); }
+.setup-step.running > svg { color: var(--accent); }
+.setup-step.error > svg { color: var(--danger); }
+.setup-step.pending .cell-strong { color: var(--muted); font-weight: 500; }
+
 /* ---------- Auth ---------- */
 .auth { min-height: 100vh; display: grid; grid-template-columns: minmax(380px, 520px) 1fr; }
 .auth-form { display: flex; flex-direction: column; justify-content: center; padding: 48px clamp(24px, 6vw, 72px); background: var(--bg-elev); }

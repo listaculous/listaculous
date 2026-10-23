@@ -210,6 +210,7 @@ pub async fn create_site(
     Json(mut i): Json<SiteInput>,
 ) -> J {
     i.validate()?;
+    crate::crypto::seal_config(&mut i.provider_config)?;
     let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO sites (account_id, name, domain, from_name, from_email, reply_to, physical_address, provider_kind, \
          provider_config, send_rate, webhook_secret, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id",
@@ -259,6 +260,7 @@ pub async fn update_site(
     let existing = site_for(&st, &u, id).await?;
     i.validate()?;
     i.merge_secrets(&existing.provider_config);
+    crate::crypto::seal_config(&mut i.provider_config)?;
     sqlx::query(UPDATE_SITE_SQL)
         .bind(&i.name)
         .bind(&i.domain)
