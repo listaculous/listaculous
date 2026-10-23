@@ -92,10 +92,27 @@ wait: ## Wait until the server answers its health check
 ##@ Data
 
 .PHONY: backup
-backup: ## Copy the SQLite database out of the container into ./backups
+backup: ## Back up the SQLite database AND its encryption key into ./backups
 	@mkdir -p backups
 	@$(COMPOSE) exec -T $(SERVICE) sh -c 'cat /data/listaculous.db' > $(BACKUP)
-	@printf "$(G)✔ Saved $(BACKUP)$(N) (stop the container first for a fully consistent copy)\n"
+	@# Stored secrets (SES/SMTP/AWS/Porkbun keys) are encrypted with this key; a backup without it
+	@# can't decrypt them. (Not needed if you set LISTACULOUS_SECRET_KEY yourself.)
+	@$(COMPOSE) exec -T $(SERVICE) sh -c 'cat /data/secret.key 2>/dev/null' > $(BACKUP).key; \
+	if [ -s $(BACKUP).key ]; then chmod 600 $(BACKUP).key; \
+	  printf "$(G)✔ Saved $(BACKUP) + .key$(N) (keep the .key private; restore both with make restore FILE=$(BACKUP))\n"; \
+	else rm -f $(BACKUP).key; printf "$(G)✔ Saved $(BACKUP)$(N)\n"; fi
+	@printf "  Tip: stop the container first for a fully consistent copy.\n"
+
+.PHONY: restore
+restore: ## Restore a backup made by `make backup` (FILE=backups/….db); replaces current data
+	@test -n "$(FILE)" -a -f "$(FILE)" || { printf "$(R)✘ usage: make restore FILE=backups/listaculous-….db$(N)\n"; exit 1; }
+	@read -p "Replace the current database with $(FILE)? Type 'yes': " a; [ "$$a" = "yes" ] || { echo Aborted.; exit 1; }
+	@$(COMPOSE) stop $(SERVICE)
+	@$(COMPOSE) run --rm -T --no-deps --entrypoint sh $(SERVICE) -c 'cat > /data/listaculous.db && rm -f /data/listaculous.db-wal /data/listaculous.db-shm' < $(FILE)
+	@if [ -f "$(FILE).key" ]; then $(COMPOSE) run --rm -T --no-deps --entrypoint sh $(SERVICE) -c 'cat > /data/secret.key && chmod 600 /data/secret.key' < $(FILE).key; fi
+	@$(COMPOSE) up -d $(SERVICE)
+	@$(MAKE) --no-print-directory wait
+	@printf "$(G)✔ Restored $(FILE)$(N)\n"
 
 .PHONY: nuke
 nuke: ## ⚠ Stop and DELETE all data (asks for confirmation)

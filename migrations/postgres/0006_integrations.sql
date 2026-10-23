@@ -16,6 +16,7 @@ CREATE TABLE site_setups (
   site_id BIGINT PRIMARY KEY REFERENCES sites(id) ON DELETE CASCADE,
   status TEXT NOT NULL,            -- 'running' | 'applied' | 'error'
   state TEXT NOT NULL,             -- JSON: steps, created resources, errors
+  run_id TEXT NOT NULL DEFAULT '', -- the run allowed to write progress (fencing)
   updated_at TEXT NOT NULL
 );
 

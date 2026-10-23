@@ -110,7 +110,6 @@ async fn main() -> anyhow::Result<()> {
     let db = db::connect(&cfg.database_url).await?;
     crypto::migrate_plaintext(&db).await?;
     let instance_id = db::instance_id(&db).await?;
-    setup::recover_interrupted(&db).await?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;

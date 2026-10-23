@@ -245,6 +245,7 @@ pub fn setup_policy() -> Value {
                     "ses:CreateConfigurationSet", "ses:GetConfigurationSet",
                     "ses:CreateConfigurationSetEventDestination", "ses:GetConfigurationSetEventDestinations",
                     "ses:UpdateConfigurationSetEventDestination",
+                    "ses:PutEmailIdentityDkimAttributes", "ses:PutEmailIdentityDkimSigningAttributes",
                     "ses:TagResource"
                 ],
                 "Resource": "*"

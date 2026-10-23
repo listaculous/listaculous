@@ -27,8 +27,7 @@ make help      # every other target: logs, backup, dev, check, …
 
 The first `make up` creates `.env` from `.env.example`. It also picks a random free port (saved as `PORT` in `.env`; `make new-port` picks another). Links default to `http://localhost:$PORT`; set `BASE_URL` in `.env` to your public HTTPS URL before real use. On the first visit you create the admin account.
 
-Data lives in the `listaculous-data` Docker volume. Back it up with
-`docker compose cp listaculous:/data/listaculous.db ./backup.db` (stop the container first, or copy the `-wal` file too).
+Data lives in the `listaculous-data` Docker volume. Back it up with `make backup`, which saves the database **and** `secret.key`, the key that encrypts stored provider and integration credentials. Restore with `make restore FILE=backups/…db`. If you set `LISTACULOUS_SECRET_KEY` yourself, keep that value safe instead.
 
 Put it behind a TLS reverse proxy (e.g. Caddy: `news.example.com { reverse_proxy listaculous:8080 }`) and set `TRUST_PROXY=true`.
 
