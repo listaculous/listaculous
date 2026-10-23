@@ -37,7 +37,7 @@ jobs:
       - name: CI Docker config
         run: |
           # A dedicated Docker config without a credential helper: Docker Desktop's macOS Keychain
-          # helper can't be used from a background service. It also keeps the builder list
+          # helper can't be used from a background service ("User interaction is not allowed"). It also keeps the builder list
           # separate from the machine owner's. Plugins (buildx) are linked in from the usual place.
           dir="$HOME/.docker-listaculous-ci"
           mkdir -p "$dir"
@@ -46,6 +46,12 @@ jobs:
             ln -s "$HOME/.docker/cli-plugins" "$dir/cli-plugins"
           fi
           echo "DOCKER_CONFIG=$dir" >> "$GITHUB_ENV"
+          # With no credsStore set, Docker on macOS still defaults to docker-credential-osxkeychain
+          # if it's on PATH (Docker Desktop puts it next to `docker`), and the Keychain can't be
+          # used from a service. So later steps get a PATH with `docker` but no credential helpers.
+          mkdir -p "$dir/bin"
+          ln -sf "$(command -v docker)" "$dir/bin/docker"
+          echo "PATH=$dir/bin:/usr/bin:/bin:/usr/sbin:/sbin" >> "$GITHUB_ENV"
 
       - name: Persistent builder
         run: |
