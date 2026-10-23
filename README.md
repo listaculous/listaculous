@@ -27,12 +27,28 @@ make help      # every other target: logs, backup, dev, check, …
 
 The first `make up` creates `.env` from `.env.example`. It also picks a random free port (saved as `PORT` in `.env`; `make new-port` picks another). Links default to `http://localhost:$PORT`; set `BASE_URL` in `.env` to your public HTTPS URL before real use. On the first visit you create the admin account.
 
-Data lives in the `listaculous-data` Docker volume. Back it up with
-`docker compose cp listaculous:/data/listaculous.db ./backup.db` (stop the container first, or copy the `-wal` file too).
+Data lives in the `listaculous-data` Docker volume. Back it up with `make backup`, which saves the database **and** `secret.key`, the key that encrypts stored provider and integration credentials. Restore with `make restore FILE=backups/…db`. If you set `LISTACULOUS_SECRET_KEY` yourself, keep that value safe instead.
 
 Put it behind a TLS reverse proxy (e.g. Caddy: `news.example.com { reverse_proxy listaculous:8080 }`) and set `TRUST_PROXY=true`.
 
-## Setting up a site with Amazon SES
+## Automatic SES + DNS setup
+
+Connect AWS (and optionally Porkbun) under **Integrations**, then open a site → **Deliverability → Automatic setup**. Listaculous previews every change, and after you click **Apply** it:
+
+- verifies your sending subdomain in SES with Easy DKIM,
+- sets a custom MAIL FROM (`bounce.<subdomain>`) for SPF alignment,
+- adds a DMARC record (`p=none`) if the domain has none (an existing policy is never replaced),
+- routes bounces and complaints through a configuration set and SNS to Listaculous (needs a public HTTPS `BASE_URL`),
+- creates a **send-only** IAM user for the site and switches the site to its key,
+- creates the DNS records in Porkbun, or lists them for you to add by hand.
+
+It only ever *adds* DNS records, never edits or deletes them, and stops if one conflicts. Re-running it is safe. If your account is in the SES sandbox, Listaculous drafts a production access request for you to edit and submit.
+
+The AWS key you connect is only used for setup; the exact IAM policy it needs is shown on the Integrations page (and at `GET /api/integrations/aws-policy`). Once your sites are set up you can delete that key in AWS. Note that the setup policy can create IAM users under `/listaculous/`, so treat the key as sensitive.
+
+For Porkbun, create an API key and turn on **API Access** for each domain Listaculous should manage.
+
+## Setting up a site with Amazon SES manually
 
 1. In SES, verify your domain and publish the DKIM CNAMEs. Add SPF (`include:amazonses.com`) and a DMARC record (`v=DMARC1; p=none; rua=mailto:you@yourdomain`) — start with `p=none`, tighten later. Optionally configure a custom MAIL FROM domain for SPF alignment.
 2. Request production access (leave the SES sandbox).
@@ -62,6 +78,7 @@ curl -H "Authorization: Bearer $LISTACULOUS_KEY" http://localhost:8080/api/sites
 | `LISTACULOUS_BIND` | `0.0.0.0:8080` | |
 | `STATIC_DIR` | `web/dist` | Built admin UI |
 | `TRUST_PROXY` | `false` | Use `X-Forwarded-For` for client IP |
+| `LISTACULOUS_SECRET_KEY` | generated | Base64 32-byte key encrypting stored secrets. Auto-generated as `secret.key` next to a SQLite DB; **required** with Postgres. Back it up with your data. |
 
 ## Development
 

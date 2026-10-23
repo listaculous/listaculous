@@ -4,6 +4,7 @@
   import UserRound from '@lucide/svelte/icons/user-round';
   import LogOut from '@lucide/svelte/icons/log-out';
   import BookOpen from '@lucide/svelte/icons/book-open';
+  import Plug from '@lucide/svelte/icons/plug';
   import Menu from '@lucide/svelte/icons/menu';
   import Plus from '@lucide/svelte/icons/plus';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
@@ -20,6 +21,7 @@
   import List from './pages/List.svelte';
   import Campaign from './pages/Campaign.svelte';
   import Account from './pages/Account.svelte';
+  import Integrations from './pages/Integrations.svelte';
 
   let user = $state(null);
   let ready = $state(false);
@@ -74,6 +76,7 @@
 
       <a class="nav-link" class:active={isActive('/')} href="#/"><LayoutDashboard size={17} /> Dashboard</a>
       <a class="nav-link" class:active={isActive('/account')} href="#/account"><UserRound size={17} /> Account</a>
+      <a class="nav-link" class:active={isActive('/integrations')} href="#/integrations"><Plug size={17} /> Integrations</a>
       <a class="nav-link" href="/docs" target="_blank" rel="noopener"><BookOpen size={17} /> API docs</a>
 
       <div class="nav-label">Sites</div>
@@ -115,6 +118,8 @@
               <List {id} tab={route.parts[2] || 'subscribers'} />
             {:else if page === 'campaigns' && id}
               <Campaign {id} />
+            {:else if page === 'integrations'}
+              <Integrations />
             {:else if page === 'account'}
               <Account />
             {:else}

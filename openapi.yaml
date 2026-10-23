@@ -80,6 +80,27 @@ tags:
     description: People subscribed to a list.
   - name: Campaigns
     description: Emails sent to a list.
+  - name: Integrations
+    description: |
+      Connected cloud accounts used for automatic setup: an **AWS setup key** (see
+      `GET /api/integrations/aws-policy` for the exact IAM policy) and **Porkbun** DNS API keys.
+      Secrets are verified with the provider, encrypted at rest and never returned.
+  - name: Automatic setup
+    description: |
+      Sets up Amazon SES sending for a site end to end: SES identity with Easy DKIM, custom MAIL
+      FROM, DMARC, bounce/complaint notifications to Listaculous, and a send-only IAM key. With a
+      DNS integration the records are created for you.
+
+      **Agent workflow**
+      1. `POST /api/integrations` once for AWS (and Porkbun).
+      2. `POST /api/sites/{id}/setup/plan` and review `steps` / `records` (read-only).
+      3. `POST /api/sites/{id}/setup/apply` with `"confirm": true`.
+      4. Poll `GET /api/sites/{id}/setup?aws_integration_id=…` until `status` is `applied` and
+         `verification.dkim` is `SUCCESS` (DNS can take minutes to hours).
+      5. If `plan.account.sandbox` is true, `GET …/production-access` for a draft, edit it, then
+         `POST` it to request production access.
+
+      Setup never deletes or edits existing DNS records; conflicts stop it with an explanation.
   - name: Public
     description: |
       Unauthenticated endpoints used by signup forms, confirmation/unsubscribe links and provider
@@ -326,6 +347,168 @@ paths:
         '200': { $ref: '#/components/responses/User' }
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
+
+  # ------------------------------------------------------------------------------- Integrations
+  /api/integrations:
+    get:
+      tags: [Integrations]
+      operationId: listIntegrations
+      summary: List connected accounts
+      responses:
+        '200':
+          description: Integrations (secrets omitted).
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Integration' } }
+    post:
+      tags: [Integrations]
+      operationId: createIntegration
+      summary: Connect an AWS or Porkbun account
+      description: The credentials are checked with the provider (AWS `GetCallerIdentity`, Porkbun `ping`) before saving.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, config]
+              properties:
+                kind: { type: string, enum: [aws, porkbun] }
+                name: { type: string, maxLength: 60 }
+                config:
+                  oneOf:
+                    - title: AWS
+                      type: object
+                      required: [access_key_id, secret_access_key]
+                      properties:
+                        access_key_id: { type: string }
+                        secret_access_key: { type: string, writeOnly: true }
+                        region: { type: string, default: us-east-1 }
+                    - title: Porkbun
+                      type: object
+                      required: [api_key, secret_api_key]
+                      properties:
+                        api_key: { type: string, writeOnly: true }
+                        secret_api_key: { type: string, writeOnly: true }
+      responses:
+        '201':
+          description: Connected.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Integration' } } }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/integrations/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    delete:
+      tags: [Integrations]
+      operationId: deleteIntegration
+      summary: Remove a connected account
+      description: Sites keep working; their own send-only keys aren't affected.
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/integrations/aws-policy:
+    get:
+      tags: [Integrations]
+      operationId: getAwsSetupPolicy
+      summary: IAM policy for the AWS setup key
+      description: Attach this policy to the IAM user whose key you connect. Send-only users Listaculous creates live under the `/listaculous/` IAM path.
+      responses:
+        '200':
+          description: IAM policy document.
+          content: { application/json: { schema: { type: object } } }
+
+  # ------------------------------------------------------------------------------- Automatic setup
+  /api/sites/{id}/setup:
+    parameters:
+      - { $ref: '#/components/parameters/SiteId' }
+      - { name: aws_integration_id, in: query, schema: { type: integer }, description: Also live-check DKIM / MAIL FROM verification with this AWS integration. }
+    get:
+      tags: [Automatic setup]
+      operationId: getSetupStatus
+      summary: Setup progress and verification
+      responses:
+        '200':
+          description: Current state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [not_started, running, applied, error] }
+                  state:
+                    type: object
+                    description: '`plan`, per-step `steps` ({status, detail, at}), created `resources`, and `error`.'
+                  verification_error: { type: string, description: Set when the live verification check failed (the saved state is still returned). }
+                  verification:
+                    type: object
+                    properties:
+                      dkim: { type: string, enum: [PENDING, SUCCESS, FAILED, TEMPORARY_FAILURE, NOT_STARTED] }
+                      mail_from: { type: string }
+                      verified_for_sending: { type: boolean }
+  /api/sites/{id}/setup/plan:
+    parameters: [{ $ref: '#/components/parameters/SiteId' }]
+    post:
+      tags: [Automatic setup]
+      operationId: planSetup
+      summary: Preview the setup (read-only)
+      description: Inspects AWS and DNS and returns every change that `apply` would make. Makes no changes.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SetupRequest' } } }
+      responses:
+        '200':
+          description: The plan.
+          content: { application/json: { schema: { $ref: '#/components/schemas/SetupPlan' } } }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/sites/{id}/setup/apply:
+    parameters: [{ $ref: '#/components/parameters/SiteId' }]
+    post:
+      tags: [Automatic setup]
+      operationId: applySetup
+      summary: Run the setup
+      description: |
+        Requires `"confirm": true`. Re-plans first and refuses if any DNS record conflicts. Runs in
+        the background and is safe to re-run; poll `GET /api/sites/{id}/setup`. On success the site
+        sends through SES with a newly created send-only key.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SetupRequest' } } }
+      responses:
+        '200': { description: Started; same shape as the status endpoint. }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { description: Already running., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/sites/{id}/setup/production-access:
+    parameters: [{ $ref: '#/components/parameters/SiteId' }]
+    get:
+      tags: [Automatic setup]
+      operationId: getProductionAccessDraft
+      summary: Draft an SES production access request
+      description: A pre-filled request describing this site's opt-in, unsubscribe and bounce handling, to review and edit.
+      responses:
+        '200':
+          description: Draft.
+          content: { application/json: { schema: { $ref: '#/components/schemas/ProductionAccess' } } }
+    post:
+      tags: [Automatic setup]
+      operationId: requestProductionAccess
+      summary: Request SES production access
+      description: Submits the request to AWS (account-wide for the region). AWS reviews it, usually within ~24 hours.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/ProductionAccess'
+                - type: object
+                  required: [aws_integration_id]
+                  properties:
+                    aws_integration_id: { type: integer }
+                    region: { type: string }
+      responses:
+        '200':
+          description: Submitted.
+          content: { application/json: { schema: { type: object, properties: { ok: { type: boolean }, review_status: { type: string }, region: { type: string } } } } }
+        '400': { $ref: '#/components/responses/Error' }
 
   # ------------------------------------------------------------------------------- Dashboard
   /api/dashboard:
@@ -1098,6 +1281,70 @@ components:
         kind: { type: string, enum: [bounce, complaint] }
         detail: { type: string }
         created_at: { type: string, format: date-time }
+    Integration:
+      type: object
+      properties:
+        id: { type: integer }
+        kind: { type: string, enum: [aws, porkbun] }
+        name: { type: string }
+        summary: { type: object, description: Non-secret hints such as the key prefix and region. }
+        details: { type: object, description: 'For AWS: `aws_account_id` and `arn` of the key.' }
+        created_at: { type: string, format: date-time }
+    SetupRequest:
+      type: object
+      required: [aws_integration_id]
+      properties:
+        aws_integration_id: { type: integer }
+        dns_integration_id: { type: [integer, 'null'], description: Omit to add DNS records yourself (they're listed in the plan). }
+        region: { type: string, description: SES region; defaults to the integration's region. }
+        confirm: { type: boolean, description: Must be true for apply. }
+    SetupPlan:
+      type: object
+      properties:
+        site_id: { type: integer }
+        region: { type: string }
+        zone: { type: string, example: example.com }
+        identity: { type: string, example: news.example.com }
+        mail_from_domain: { type: string, example: bounce.news.example.com }
+        dns: { type: string, enum: [automatic, manual] }
+        can_apply: { type: boolean, description: False when a DNS record conflicts. }
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, enum: [identity, mail_from, dns, feedback, sender] }
+              title: { type: string }
+              action: { type: string, enum: [create, exists, skip, manual, conflict] }
+              note: { type: [string, 'null'] }
+        records:
+          type: array
+          items:
+            type: object
+            properties:
+              group: { type: string, enum: [dkim, mail_from, dmarc] }
+              name: { type: string, description: Relative to the zone. }
+              fqdn: { type: string }
+              type: { type: string, enum: [CNAME, MX, TXT] }
+              content: { type: string }
+              priority: { type: [integer, 'null'] }
+              action: { type: string, enum: [create, exists, conflict, manual] }
+              note: { type: [string, 'null'] }
+        account:
+          type: object
+          properties:
+            sandbox: { type: boolean }
+            max_24_hour_send: { type: number }
+            max_send_rate: { type: number }
+            review_status: { type: [string, 'null'] }
+    ProductionAccess:
+      type: object
+      required: [website_url, use_case_description]
+      properties:
+        mail_type: { type: string, enum: [MARKETING, TRANSACTIONAL], default: MARKETING }
+        website_url: { type: string, format: uri }
+        contact_emails: { type: array, items: { type: string, format: email } }
+        use_case_description: { type: string, minLength: 50 }
     SubscribeForm:
       type: object
       required: [email]

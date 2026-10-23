@@ -91,11 +91,33 @@ wait: ## Wait until the server answers its health check
 
 ##@ Data
 
+# Shell snippet (run inside the container) that resolves the SQLite file from DATABASE_URL.
+DB_PATHS = case "$$DATABASE_URL" in sqlite:*) ;; *) echo "backup/restore here are for SQLite; use pg_dump for Postgres" >&2; exit 1;; esac; \
+	db=$${DATABASE_URL\#sqlite://}; db=$${db\#sqlite:}; db=$${db%%\?*}; dir=$$(dirname "$$db")
+
 .PHONY: backup
-backup: ## Copy the SQLite database out of the container into ./backups
+backup: ## Back up the SQLite database AND its encryption key into ./backups
 	@mkdir -p backups
-	@$(COMPOSE) exec -T $(SERVICE) sh -c 'cat /data/listaculous.db' > $(BACKUP)
-	@printf "$(G)✔ Saved $(BACKUP)$(N) (stop the container first for a fully consistent copy)\n"
+	@# VACUUM INTO makes a consistent copy of the live database (including the WAL).
+	@$(COMPOSE) exec -T $(SERVICE) sh -c '$(DB_PATHS); t="$$dir/.backup.db"; rm -f "$$t" && listaculous backup "$$t" && cat "$$t" && rm -f "$$t"' > $(BACKUP)
+	@# Stored secrets (SES/SMTP/AWS/Porkbun keys) are encrypted with this key; a backup without it
+	@# can't decrypt them. (Not needed if you set LISTACULOUS_SECRET_KEY yourself.)
+	@$(COMPOSE) exec -T $(SERVICE) sh -c '$(DB_PATHS); cat "$$dir/secret.key" 2>/dev/null' > $(BACKUP).key; \
+	if [ -s $(BACKUP).key ]; then chmod 600 $(BACKUP).key; \
+	  printf "$(G)✔ Saved $(BACKUP) + .key$(N) (keep the .key private; restore both with make restore FILE=$(BACKUP))\n"; \
+	else rm -f $(BACKUP).key; printf "$(G)✔ Saved $(BACKUP)$(N)\n"; fi
+
+.PHONY: restore
+restore: ## Restore a backup made by `make backup` (FILE=backups/….db); replaces current data
+	@test -n "$(FILE)" -a -f "$(FILE)" || { printf "$(R)✘ usage: make restore FILE=backups/listaculous-….db$(N)\n"; exit 1; }
+	@read -p "Replace the current database with $(FILE)? Type 'yes': " a; [ "$$a" = "yes" ] || { echo Aborted.; exit 1; }
+	@$(COMPOSE) stop $(SERVICE)
+	@# The service is stopped, so the old WAL can be discarded: the backup is a complete database.
+	@$(COMPOSE) run --rm -T --no-deps --entrypoint sh $(SERVICE) -c '$(DB_PATHS); cat > "$$db" && rm -f "$$db-wal" "$$db-shm"' < $(FILE)
+	@if [ -f "$(FILE).key" ]; then $(COMPOSE) run --rm -T --no-deps --entrypoint sh $(SERVICE) -c '$(DB_PATHS); cat > "$$dir/secret.key" && chmod 600 "$$dir/secret.key"' < $(FILE).key; fi
+	@$(COMPOSE) up -d $(SERVICE)
+	@$(MAKE) --no-print-directory wait
+	@printf "$(G)✔ Restored $(FILE)$(N)\n"
 
 .PHONY: nuke
 nuke: ## ⚠ Stop and DELETE all data (asks for confirmation)

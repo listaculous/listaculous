@@ -29,7 +29,7 @@ pub const SITE_COLS: &str =
     provider_kind, provider_config, send_rate, webhook_secret, created_at, icon_type, icon_checked_at";
 
 /// Keys inside provider_config that are secrets and never returned to the browser.
-pub const SECRET_KEYS: &[&str] = &["secret_access_key", "password"];
+pub const SECRET_KEYS: &[&str] = crate::crypto::SECRET_FIELDS;
 
 impl Site {
     pub fn masked_provider_config(&self) -> serde_json::Value {

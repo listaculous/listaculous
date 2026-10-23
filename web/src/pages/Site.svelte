@@ -10,6 +10,7 @@
   import { go } from '../router.svelte.js';
   import { nav, refreshNav } from '../stores.svelte.js';
   import SiteIcon from '../components/SiteIcon.svelte';
+  import AutoSetup from '../components/AutoSetup.svelte';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import SiteForm from './SiteForm.svelte';
   import Alert from '../components/Alert.svelte';
@@ -155,6 +156,7 @@
         <button class="danger" onclick={remove}><Trash2 size={16} /> Delete site</button></div>
     </div>
   {:else if tab === 'deliverability'}
+    <AutoSetup {site} onApplied={() => { load(); refreshNav(); }} />
     <div class="grid-2">
       <div class="card">
         <div class="card-head"><div><h2>Send a test email</h2><p class="muted small">Checks that {site.provider_kind.toUpperCase()} is configured correctly.</p></div></div>
@@ -174,7 +176,7 @@
       </div>
     </div>
     <div class="card">
-      <div class="card-head"><div><h2>Bounce & complaint handling (Amazon SES)</h2><p class="muted small">Connect SES notifications so bad addresses are suppressed automatically.</p></div></div>
+      <div class="card-head"><div><h2>Manual bounce & complaint setup (Amazon SES)</h2><p class="muted small">Not needed if you use Automatic setup above. To connect SES notifications by hand:</p></div></div>
       <ol class="steps">
         <li><div>In <strong>Amazon SNS</strong>, create a topic, e.g. <code>listaculous-{site.domain}</code>.</div></li>
         <li><div style="min-width:0">Add an <strong>HTTPS</strong> subscription pointing at this endpoint (it confirms automatically):
