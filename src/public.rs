@@ -104,9 +104,9 @@ async fn do_subscribe(
             "Too many requests. Please try again later.",
         ));
     }
-    let list: List = sqlx::query_as(&format!(
+    let list: List = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {LIST_COLS} FROM lists WHERE public_id = $1"
-    ))
+    )))
     .bind(public_id)
     .fetch_optional(&st.db)
     .await?
@@ -121,10 +121,12 @@ async fn do_subscribe(
     }
     let name: String = form.name.trim().chars().take(100).collect();
 
-    let site: Site = sqlx::query_as(&format!("SELECT {SITE_COLS} FROM sites WHERE id = $1"))
-        .bind(list.site_id)
-        .fetch_one(&st.db)
-        .await?;
+    let site: Site = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {SITE_COLS} FROM sites WHERE id = $1"
+    )))
+    .bind(list.site_id)
+    .fetch_one(&st.db)
+    .await?;
 
     let outcome = upsert_subscription(
         st,

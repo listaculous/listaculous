@@ -1,5 +1,4 @@
 use anyhow::Context;
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use sqlx::any::AnyPoolOptions;
 use sqlx::AnyPool;
@@ -61,7 +60,7 @@ fn redact(url: &str) -> String {
 /// A short random id for this installation, created once and kept in the settings table.
 pub async fn instance_id(db: &Db) -> anyhow::Result<String> {
     let mut buf = [0u8; 4];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::fill(&mut buf[..]);
     sqlx::query(
         "INSERT INTO settings (key, value) VALUES ('instance_id', $1) ON CONFLICT (key) DO NOTHING",
     )
@@ -100,7 +99,7 @@ pub fn now() -> String {
 
 pub fn random_token(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::fill(&mut buf[..]);
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }

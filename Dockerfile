@@ -26,7 +26,8 @@ RUN npm run build
 # builds below read it concurrently without racing.
 FROM --platform=$BUILDPLATFORM ${ZIGBUILD_IMAGE} AS deps
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+# Installs the pinned toolchain and musl targets (rust-toolchain.toml), then fetches every crate.
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && cargo fetch --locked && rm -rf src
 
 # ---- server (cross-compiled for the target platform) ----

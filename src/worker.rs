@@ -121,10 +121,12 @@ async fn tick(st: &AppState, buckets: &mut RateBuckets) -> anyhow::Result<()> {
         by_site.entry(site_id).or_default().push(cid);
     }
     for (site_id, campaign_ids) in by_site {
-        let site: Site = sqlx::query_as(&format!("SELECT {SITE_COLS} FROM sites WHERE id = $1"))
-            .bind(site_id)
-            .fetch_one(&st.db)
-            .await?;
+        let site: Site = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {SITE_COLS} FROM sites WHERE id = $1"
+        )))
+        .bind(site_id)
+        .fetch_one(&st.db)
+        .await?;
         for cid in campaign_ids {
             match process_campaign(st, &site, cid, buckets).await {
                 Ok(()) => {}
@@ -183,19 +185,21 @@ async fn process_campaign(
     buckets: &mut RateBuckets,
 ) -> anyhow::Result<()> {
     // Re-read the campaign now: it may have been paused since the tick started.
-    let c: Campaign = sqlx::query_as(&format!(
+    let c: Campaign = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {CAMPAIGN_COLS} FROM campaigns WHERE id = $1"
-    ))
+    )))
     .bind(campaign_id)
     .fetch_one(&st.db)
     .await?;
     if c.status != "sending" {
         return Ok(());
     }
-    let list: List = sqlx::query_as(&format!("SELECT {LIST_COLS} FROM lists WHERE id = $1"))
-        .bind(c.list_id)
-        .fetch_one(&st.db)
-        .await?;
+    let list: List = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {LIST_COLS} FROM lists WHERE id = $1"
+    )))
+    .bind(c.list_id)
+    .fetch_one(&st.db)
+    .await?;
     if site.physical_address.trim().is_empty() {
         anyhow::bail!("site has no physical mailing address (required in every footer)");
     }
