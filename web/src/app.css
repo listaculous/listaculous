@@ -120,6 +120,8 @@ fieldset { border: 0; padding: 0; margin: 0; }
 .choice:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent) inset; }
 .choice:has(input:focus-visible) { box-shadow: 0 0 0 3px var(--ring); }
 .choice input { position: absolute; opacity: 0; pointer-events: none; }
+.choice:has(input:disabled) { opacity: .55; cursor: not-allowed; }
+.choice:has(input:disabled):hover { border-color: var(--border-strong); }
 .choice .ci { color: var(--accent); margin-top: 1px; }
 .choice strong { display: block; font-size: 14px; }
 .choice span { font-size: 12px; color: var(--muted); }
@@ -259,3 +261,11 @@ pre.code { background: var(--bg-sunken); border: 1px solid var(--border); paddin
 .divider { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; margin: 18px 0; }
 .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
 @media (max-width: 860px) { .auth { grid-template-columns: 1fr; } .auth-art { display: none; } }
+
+/* New-site wizard progress */
+.wizard-steps { list-style: none; padding: 0; margin: 0 0 18px; display: flex; gap: 22px; flex-wrap: wrap; font-size: 14px; color: var(--muted); }
+.wizard-steps li { display: flex; align-items: center; gap: 8px; font-weight: 550; }
+.wizard-steps .n { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 700; border: 1px solid var(--border-strong); }
+.wizard-steps li.current { color: var(--text); }
+.wizard-steps li.current .n { background: var(--accent); border-color: var(--accent); color: #fff; }
+.wizard-steps li.done .n { background: var(--accent-soft); border-color: var(--accent-soft); color: var(--accent); }

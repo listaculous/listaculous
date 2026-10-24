@@ -7,14 +7,18 @@
   import Save from '@lucide/svelte/icons/save';
   import { api } from '../api.js';
   import Alert from '../components/Alert.svelte';
-  let { site = null, onSaved } = $props();
+  // `sections`: 'all', 'details' (website + sender) or 'provider' (email provider only).
+  let { site = null, onSaved, sections = 'all', submitLabel = '' } = $props();
+  const showDetails = $derived(sections !== 'provider');
+  const showProvider = $derived(sections !== 'details');
 
   const blank = {
     name: '', domain: '', from_name: '', from_email: '', reply_to: '', physical_address: '',
     provider_kind: 'ses', provider_config: {}, send_rate: 10,
   };
   // The form edits a copy of the site as it was when opened.
-  let f = $state(untrack(() => (site ? { ...blank, ...$state.snapshot(site) } : structuredClone(blank))));
+  // A new site created without the provider section sends nothing until a provider is chosen.
+  let f = $state(untrack(() => (site ? { ...blank, ...$state.snapshot(site) } : { ...structuredClone(blank), ...(sections === 'details' ? { provider_kind: 'log' } : {}) })));
   let error = $state('');
   let saved = $state(false);
   let busy = $state(false);
@@ -44,6 +48,7 @@
 </script>
 
 <form onsubmit={submit}>
+  {#if showDetails}
   <div class="section-title">Website</div>
   <div class="grid-2">
     <label class="field">Site name <input bind:value={f.name} required placeholder="My Blog" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
@@ -67,7 +72,9 @@
     <textarea rows="2" bind:value={f.physical_address} placeholder="123 Main St, Springfield, UT 84000, USA" style="font-family:var(--font)"></textarea>
     <span class="hint">Required by CAN-SPAM and shown in every email footer. A PO box or registered agent address is fine.</span>
   </label>
+  {/if}
 
+  {#if showProvider}
   <div class="section-title">Email provider</div>
   <div class="choices" role="radiogroup" aria-label="Email provider">
     {#each providers as p (p.value)}
@@ -105,10 +112,11 @@
   {:else}
     <Alert kind="warn">Emails are only written to the server log. Great for trying things out — switch to a real provider before launching.</Alert>
   {/if}
+  {/if}
 
   {#if error}<Alert kind="error">{error}</Alert>{/if}
-  {#if saved && site}<Alert kind="ok">Saved.</Alert>{/if}
+  {#if saved && site && !submitLabel}<Alert kind="ok">Saved.</Alert>{/if}
   <div class="actions" style="margin-top:8px">
-    <button class="lg" disabled={busy}><Save size={16} /> {site ? 'Save changes' : 'Create site'}</button>
+    <button class="lg" disabled={busy}><Save size={16} /> {submitLabel || (site ? 'Save changes' : 'Create site')}</button>
   </div>
 </form>
