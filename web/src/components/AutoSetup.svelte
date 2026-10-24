@@ -13,7 +13,8 @@
   import { api, fmtDate } from '../api.js';
   import Alert from './Alert.svelte';
 
-  let { site, onApplied } = $props();
+  // `returnTo`: route the Integrations page links back to (for flows that send the user there).
+  let { site, onApplied, onStatus, returnTo = '' } = $props();
 
   let integrations = $state([]);
   let awsId = $state(null);
@@ -21,6 +22,8 @@
   let region = $state('');
   let plan = $state(null);
   let setup = $state({ status: 'not_started' });
+  let applying = $state(false); // an Apply request is in flight
+  let statusKnown = $state(false); // false until the server has reported this site's setup status
   let busy = $state(false);
   let error = $state('');
   let draft = $state(null);
@@ -52,10 +55,12 @@
     }
     await refresh();
   }
-  init();
+  init().catch((err) => { error = err.message; if (!statusKnown) onStatus?.('unknown'); });
 
   let refreshSeq = 0;
+  // Resolves true once the server's current status has been applied.
   async function refresh() {
+    let ok = false;
     clearTimeout(poll);
     const n = ++refreshSeq;
     const forAws = awsId;
@@ -63,17 +68,22 @@
       const q = forAws ? `?aws_integration_id=${forAws}` : '';
       const r = await api(`/sites/${site.id}/setup${q}`);
       // A slower response for a previously selected account must not overwrite the current one.
-      if (n !== refreshSeq || forAws !== awsId) return;
+      if (n !== refreshSeq || forAws !== awsId) return false;
       setup = r;
+      statusKnown = true;
+      ok = true;
     } catch (err) {
       error = err.message;
+      // Only the first check matters to the parent: later poll failures leave the known status.
+      if (!statusKnown) onStatus?.('unknown');
     }
-    if (destroyed) return;
+    if (destroyed) return ok;
     // Fast polling while running; slower while DNS verification is pending.
     const v = setup.verification;
     const pending = setup.status === 'applied' && v && (v.dkim !== 'SUCCESS' || v.mail_from !== 'SUCCESS');
     if (setup.status === 'running') poll = setTimeout(refresh, 1500);
     else if (pending) poll = setTimeout(refresh, 20000);
+    return ok;
   }
 
   // The plan shown is always for the exact selections it was requested with, and apply submits
@@ -109,12 +119,23 @@
     if (!confirm(`Set up ${plan.identity} in Amazon SES (${plan.region}), ${dnsText}, and switch ${site.name} to a new send-only key?`)) return;
     busy = true;
     error = '';
+    // The server may start provisioning before the request returns: report running until it
+    // settles, and drop any status checks already in flight (they predate this run).
+    applying = true;
+    clearTimeout(poll);
+    refreshSeq++;
     try {
       setup = await api(`/sites/${site.id}/setup/apply`, { method: 'POST', body: { ...planReq, confirm: true } });
       refresh();
     } catch (err) {
       error = err.message;
+      // The run may have started anyway: keep the lock until the server says whether it did
+      // (refresh also resumes polling if it's running).
+      for (let delay = 2000; !destroyed && !(await refresh()); delay = Math.min(delay * 2, 30000)) {
+        await new Promise((r) => setTimeout(r, delay));
+      }
     } finally {
+      applying = false;
       busy = false;
     }
   }
@@ -125,6 +146,7 @@
   let lastStatus = null;
   $effect(() => {
     const status = setup.status;
+    if (statusKnown || applying) onStatus?.(applying ? 'running' : status);
     if (lastStatus === 'running' && (status === 'applied' || status === 'error')) {
       if (status === 'applied') onApplied?.();
       if (plan && planReq) preview();
@@ -208,7 +230,7 @@
 
 
   {#if !hasAws}
-    <Alert kind="info">Connect an AWS account (and optionally Porkbun) on the <a href="#/integrations">Integrations</a> page to enable automatic setup.</Alert>
+    <Alert kind="info">Connect an AWS account (and optionally Porkbun) on the <a href="#/integrations{returnTo ? `?return=${returnTo}` : ''}">Integrations</a> page to enable automatic setup.</Alert>
   {:else}
     <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin-bottom:4px">
       <label class="field">AWS account

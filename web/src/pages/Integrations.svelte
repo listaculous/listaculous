@@ -9,6 +9,7 @@
   import Terminal from '@lucide/svelte/icons/terminal';
   import Download from '@lucide/svelte/icons/download';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
+  import ArrowLeft from '@lucide/svelte/icons/arrow-left';
   import { onDestroy } from 'svelte';
   import { api, fmtDate } from '../api.js';
   import Alert from '../components/Alert.svelte';
@@ -171,6 +172,9 @@
   let msg = $state('');
   let error = $state('');
 
+  // Set by pages that send the user here mid-task (e.g. the new-site wizard), to offer a way back.
+  const returnTo = (location.hash.split('?')[1] ?? '').match(/^return=(\/[\w/-]+)$/)?.[1] ?? null;
+
   async function load() {
     items = await api('/integrations');
   }
@@ -214,6 +218,12 @@
   </div>
 </div>
 
+{#if returnTo}
+  <Alert kind="info">
+    {#if awsItems.length}<a href="#{returnTo}"><ArrowLeft size={14} style="vertical-align:-2px" /> Back to site setup</a>
+    {:else}Connect an AWS account below, then go <a href="#{returnTo}">back to site setup</a>.{/if}
+  </Alert>
+{/if}
 {#if msg}<Alert kind="ok">{msg}</Alert>{/if}
 {#if error}<Alert kind="error">{error}</Alert>{/if}
 
