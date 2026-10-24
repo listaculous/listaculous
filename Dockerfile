@@ -36,9 +36,11 @@ COPY src ./src
 COPY migrations ./migrations
 COPY openapi.yaml ./openapi.yaml
 # Dependencies come from the deps layer (offline); each arch keeps its own target-dir cache, so
-# only changed code recompiles.
+# only changed code recompiles. Zig's linker opens every object file at once (~1,700), more than
+# the default soft limit of 1024 open files on some hosts, so raise it to the hard limit.
 RUN --mount=type=cache,id=lc-target-${TARGETARCH},target=/src/target \
     set -eu; \
+    ulimit -n "$(ulimit -Hn)"; \
     case "$TARGETARCH" in \
       amd64) TRIPLE=x86_64-unknown-linux-musl ;; \
       arm64) TRIPLE=aarch64-unknown-linux-musl ;; \
