@@ -43,6 +43,26 @@ pub struct SetupRequest {
     pub confirm: bool,
 }
 
+/// Policy for a site's send-only IAM user. SES authorizes a send against every identity involved,
+/// including verified *recipient* identities (as in the sandbox, where every recipient must be
+/// verified), so the policy can't name just the sender's identity. Instead it allows any identity
+/// in the account and region, but only with a From address on the site's own domain.
+fn send_policy(region: &str, account_id: &str, identity: &str, config_set: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": ["ses:SendEmail", "ses:SendRawEmail"],
+            "Resource": [
+                format!("arn:aws:ses:{region}:{account_id}:identity/*"),
+                format!("arn:aws:ses:{region}:{account_id}:configuration-set/{config_set}")
+            ],
+            "Condition": { "StringLike": { "ses:FromAddress": format!("*@{identity}") } }
+        }]
+    })
+    .to_string()
+}
+
 /// Everything derived from the site that the plan and apply share.
 struct Target {
     site: Site,
@@ -905,18 +925,7 @@ async fn run(
         Err(e) if e.code == "EntityAlreadyExists" => {}
         Err(e) => return Err(e.into()),
     }
-    let send_policy = json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Action": ["ses:SendEmail", "ses:SendRawEmail"],
-            "Resource": [
-                format!("arn:aws:ses:{}:{account_id}:identity/{}", aws.region, t.identity),
-                format!("arn:aws:ses:{}:{account_id}:configuration-set/{}", aws.region, t.config_set)
-            ]
-        }]
-    })
-    .to_string();
+    let send_policy = send_policy(&aws.region, &account_id, &t.identity, &t.config_set);
     aws.query(
         "iam",
         &[
@@ -1340,6 +1349,29 @@ pub async fn request_production_access(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_policy_allows_recipient_identities_but_pins_the_sender() {
+        let p: Value = serde_json::from_str(&send_policy(
+            "us-west-1",
+            "123",
+            "news.example.com",
+            "lc-cs",
+        ))
+        .unwrap();
+        let st = &p["Statement"][0];
+        assert_eq!(
+            st["Resource"],
+            json!([
+                "arn:aws:ses:us-west-1:123:identity/*",
+                "arn:aws:ses:us-west-1:123:configuration-set/lc-cs"
+            ])
+        );
+        assert_eq!(
+            st["Condition"]["StringLike"]["ses:FromAddress"],
+            "*@news.example.com"
+        );
+    }
 
     fn rec(name: &str, kind: &str, content: &str) -> Record {
         Record {
