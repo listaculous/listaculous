@@ -26,6 +26,13 @@ use axum::Router;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
+/// Build version: `YYYY.MM.DD.HHMM` (UTC) for release images, set by the release workflow at
+/// compile time; `dev` for local builds.
+pub const VERSION: &str = match option_env!("LISTACULOUS_VERSION") {
+    Some(v) => v,
+    None => "dev",
+};
+
 #[derive(Clone)]
 pub struct Config {
     pub bind: String,
@@ -258,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
     tracing::info!(
-        "listaculous listening on {} (public url {})",
+        "listaculous {VERSION} listening on {} (public url {})",
         cfg.bind,
         cfg.base_url
     );

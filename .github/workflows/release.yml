@@ -69,23 +69,33 @@ jobs:
       - name: Tags
         id: meta
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # Calendar version from the build start time (UTC): YYYY.MM.DD.HHMM. Releases run one at a
+          # time; if the previous one published in this same minute, wait for the next minute.
+          # Cargo.toml's version isn't used for images.
+          version=$(date -u +%Y.%m.%d.%H%M)
+          while docker buildx imagetools inspect "$IMAGE:$version" >/dev/null 2>&1; do
+            echo "$IMAGE:$version already exists; waiting for the next minute"
+            sleep $((60 - $(date -u +%-S) + 1))
+            version=$(date -u +%Y.%m.%d.%H%M)
+          done
           short=${GITHUB_SHA::7}
           {
             echo "version=$version"
-            echo "tags=-t $IMAGE:latest -t $IMAGE:main -t $IMAGE:sha-$short -t $IMAGE:$version -t $IMAGE:${version%.*}"
+            echo "tags=-t $IMAGE:latest -t $IMAGE:main -t $IMAGE:sha-$short -t $IMAGE:$version"
             echo "smoke=$IMAGE:smoke-$short"
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and smoke-test (native arch)
         run: |
           # Uses the same cache as the release build, so this adds only seconds.
-          docker buildx build --builder listaculous-ci --load -t "${{ steps.meta.outputs.smoke }}" .
+          docker buildx build --builder listaculous-ci --load -t "${{ steps.meta.outputs.smoke }}" \
+            --build-arg LISTACULOUS_VERSION=${{ steps.meta.outputs.version }} .
           cid=$(docker run -d --rm -e BASE_URL=http://localhost "${{ steps.meta.outputs.smoke }}")
           trap 'docker rm -f "$cid" >/dev/null 2>&1; docker rmi "${{ steps.meta.outputs.smoke }}" >/dev/null 2>&1' EXIT
           for _ in $(seq 1 20); do
-            if docker exec "$cid" wget -qO- http://127.0.0.1:8080/healthz 2>/dev/null | grep -q ok; then
-              echo "healthz ok"; exit 0
+            if docker exec "$cid" wget -qO- http://127.0.0.1:8080/api/auth/status 2>/dev/null \
+                | grep -qF '"version":"${{ steps.meta.outputs.version }}"'; then
+              echo "up, version ${{ steps.meta.outputs.version }}"; exit 0
             fi
             sleep 0.5
           done
@@ -95,6 +105,7 @@ jobs:
         run: |
           docker buildx build --builder listaculous-ci --platform "$PLATFORMS" --push \
             ${{ steps.meta.outputs.tags }} \
+            --build-arg LISTACULOUS_VERSION=${{ steps.meta.outputs.version }} \
             --label org.opencontainers.image.revision=${{ github.sha }} \
             --label org.opencontainers.image.version=${{ steps.meta.outputs.version }} \
             .
