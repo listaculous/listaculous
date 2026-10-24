@@ -1,0 +1,6 @@
+# One compiler everywhere: local builds, CI and the Docker image (rustup installs it on first use).
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

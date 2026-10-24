@@ -112,6 +112,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // One TLS crypto provider for every rustls user (reqwest, SMTP, Postgres): ring.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cfg = Arc::new(Config::from_env());
     // `listaculous backup <file>`: consistent online copy of the SQLite database (includes WAL).
     let args: Vec<String> = std::env::args().collect();

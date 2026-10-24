@@ -18,9 +18,9 @@ use crate::AppState;
 type J = AppResult<Json<Value>>;
 
 async fn site_for(st: &AppState, u: &AuthUser, id: i64) -> AppResult<Site> {
-    sqlx::query_as(&format!(
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {SITE_COLS} FROM sites WHERE id = $1 AND account_id = $2"
-    ))
+    )))
     .bind(id)
     .bind(u.account_id)
     .fetch_optional(&st.db)
@@ -29,19 +29,21 @@ async fn site_for(st: &AppState, u: &AuthUser, id: i64) -> AppResult<Site> {
 }
 
 async fn list_for(st: &AppState, u: &AuthUser, id: i64) -> AppResult<(List, Site)> {
-    let list: List = sqlx::query_as(&format!("SELECT {LIST_COLS} FROM lists WHERE id = $1"))
-        .bind(id)
-        .fetch_optional(&st.db)
-        .await?
-        .ok_or_else(AppError::not_found)?;
+    let list: List = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {LIST_COLS} FROM lists WHERE id = $1"
+    )))
+    .bind(id)
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(AppError::not_found)?;
     let site = site_for(st, u, list.site_id).await?;
     Ok((list, site))
 }
 
 async fn campaign_for(st: &AppState, u: &AuthUser, id: i64) -> AppResult<(Campaign, List, Site)> {
-    let c: Campaign = sqlx::query_as(&format!(
+    let c: Campaign = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {CAMPAIGN_COLS} FROM campaigns WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&st.db)
     .await?
@@ -91,11 +93,11 @@ pub async fn dashboard(State(st): State<AppState>, u: AuthUser) -> J {
             },
         )
         .collect();
-    let recent: Vec<Campaign> = sqlx::query_as(&format!(
+    let recent: Vec<Campaign> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {} FROM campaigns c WHERE c.list_id IN (SELECT l.id FROM lists l JOIN sites si ON si.id = l.site_id WHERE si.account_id = $1) \
          ORDER BY c.id DESC LIMIT 10",
         CAMPAIGN_COLS.split(", ").map(|c| format!("c.{c}")).collect::<Vec<_>>().join(", ")
-    ))
+    )))
     .bind(u.account_id)
     .fetch_all(&st.db)
     .await?;
@@ -183,9 +185,9 @@ impl SiteInput {
 }
 
 pub async fn list_sites(State(st): State<AppState>, u: AuthUser) -> J {
-    let sites: Vec<Site> = sqlx::query_as(&format!(
+    let sites: Vec<Site> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {SITE_COLS} FROM sites WHERE account_id = $1 ORDER BY name"
-    ))
+    )))
     .bind(u.account_id)
     .fetch_all(&st.db)
     .await?;
@@ -373,9 +375,9 @@ fn list_json(l: &List, base_url: &str) -> Value {
 
 pub async fn list_lists(State(st): State<AppState>, u: AuthUser, Path(site_id): Path<i64>) -> J {
     site_for(&st, &u, site_id).await?;
-    let lists: Vec<List> = sqlx::query_as(&format!(
+    let lists: Vec<List> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {LIST_COLS} FROM lists WHERE site_id = $1 ORDER BY name"
-    ))
+    )))
     .bind(site_id)
     .fetch_all(&st.db)
     .await?;
@@ -410,7 +412,7 @@ pub async fn create_list(
     site_for(&st, &u, site_id).await?;
     validate_list(&i)?;
     let mut buf = [0u8; 8];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut buf);
+    rand::fill(&mut buf[..]);
     let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO lists (site_id, public_id, name, description, double_opt_in, redirect_url, created_at) \
          VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
@@ -745,9 +747,9 @@ pub async fn list_campaigns(
     Path(list_id): Path<i64>,
 ) -> J {
     list_for(&st, &u, list_id).await?;
-    let cs: Vec<Campaign> = sqlx::query_as(&format!(
+    let cs: Vec<Campaign> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {CAMPAIGN_COLS} FROM campaigns WHERE list_id = $1 ORDER BY id DESC"
-    ))
+    )))
     .bind(list_id)
     .fetch_all(&st.db)
     .await?;

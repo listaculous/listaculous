@@ -135,9 +135,9 @@ fn target(st: &AppState, site: Site, region: &str) -> AppResult<Target> {
 }
 
 async fn load_site(st: &AppState, user: &AuthUser, id: i64) -> AppResult<Site> {
-    sqlx::query_as(&format!(
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {SITE_COLS} FROM sites WHERE id = $1 AND account_id = $2"
-    ))
+    )))
     .bind(id)
     .bind(user.account_id)
     .fetch_optional(&st.db)
@@ -1465,10 +1465,12 @@ mod tests {
             .unwrap();
         sqlx::query("INSERT INTO sites (account_id, name, domain, from_name, from_email, webhook_secret, created_at) \
                      VALUES (1, 'S', 'example.com', 'F', 'hi@news.example.com', 'w', 'now')").execute(&db).await.unwrap();
-        let site: Site = sqlx::query_as(&format!("SELECT {SITE_COLS} FROM sites WHERE id = 1"))
-            .fetch_one(&db)
-            .await
-            .unwrap();
+        let site: Site = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {SITE_COLS} FROM sites WHERE id = 1"
+        )))
+        .fetch_one(&db)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO site_setups (site_id, status, state, run_id, updated_at) VALUES (1, 'running', '{}', 'old', 'now')")
             .execute(&db).await.unwrap();
         let cfg = json!({ "region": "us-east-1" });
@@ -1499,10 +1501,12 @@ mod tests {
             .to_string()
             .contains("changed"));
         // …and succeeds when they're unchanged.
-        let site: Site = sqlx::query_as(&format!("SELECT {SITE_COLS} FROM sites WHERE id = 1"))
-            .fetch_one(&db)
-            .await
-            .unwrap();
+        let site: Site = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {SITE_COLS} FROM sites WHERE id = 1"
+        )))
+        .fetch_one(&db)
+        .await
+        .unwrap();
         switch_site_provider(&db, &site, "new", &cfg).await.unwrap();
         let (kind,): (String,) = sqlx::query_as("SELECT provider_kind FROM sites WHERE id = 1")
             .fetch_one(&db)

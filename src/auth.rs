@@ -1,6 +1,5 @@
-use argon2::password_hash::{
-    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
+use argon2::PasswordHash;
 use std::net::SocketAddr;
 
 use argon2::Argon2;
@@ -319,9 +318,9 @@ async fn hash_password(pw: String) -> AppResult<String> {
     // the request future is cancelled.
     let hashed = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let salt = SaltString::generate(&mut OsRng);
+        // Generates a random salt from the OS RNG.
         Argon2::default()
-            .hash_password(pw.as_bytes(), &salt)
+            .hash_password(pw.as_bytes())
             .map(|h| h.to_string())
     })
     .await

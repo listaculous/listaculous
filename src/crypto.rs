@@ -6,7 +6,7 @@
 
 use std::sync::OnceLock;
 
-use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, Generate, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, bail, Context};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -32,7 +32,7 @@ pub fn init(database_url: &str) -> anyhow::Result<()> {
     if key.len() != 32 {
         bail!("LISTACULOUS_SECRET_KEY must decode to 32 bytes (generate one with `openssl rand -base64 32`)");
     }
-    let _ = CIPHER.set(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key)));
+    let _ = CIPHER.set(Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("bad key length"))?);
     Ok(())
 }
 
@@ -58,7 +58,7 @@ fn key_file(database_url: &str) -> anyhow::Result<Vec<u8>> {
     // Publish atomically: write + fsync a private temp file, then hard-link it into place. The
     // link fails if another process created the key first; then we use theirs. A crash can never
     // leave a partial secret.key.
-    let key = Aes256Gcm::generate_key(OsRng);
+    let key = Key::<Aes256Gcm>::generate();
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(".secret.key.{}", crate::db::random_token(8)));
     write_private(&tmp, B64.encode(key).as_bytes())?;
@@ -122,7 +122,7 @@ pub fn is_encrypted(s: &str) -> bool {
 }
 
 pub fn encrypt(plain: &str) -> anyhow::Result<String> {
-    let nonce = Aes256Gcm::generate_nonce(OsRng);
+    let nonce = aes_gcm::aead::Nonce::<Aes256Gcm>::generate();
     let ct = cipher()?
         .encrypt(&nonce, plain.as_bytes())
         .map_err(|_| anyhow!("encryption failed"))?;
@@ -141,11 +141,10 @@ pub fn decrypt(value: &str) -> anyhow::Result<String> {
         bail!("corrupt encrypted value");
     }
     let (nonce, ct) = buf.split_at(12);
-    let pt = cipher()?
-        .decrypt(Nonce::from_slice(nonce), ct)
-        .map_err(|_| {
-            anyhow!("can't decrypt a stored secret — was LISTACULOUS_SECRET_KEY changed?")
-        })?;
+    let nonce = Nonce::try_from(nonce).map_err(|_| anyhow!("corrupt encrypted value"))?;
+    let pt = cipher()?.decrypt(&nonce, ct).map_err(|_| {
+        anyhow!("can't decrypt a stored secret — was LISTACULOUS_SECRET_KEY changed?")
+    })?;
     Ok(String::from_utf8(pt)?)
 }
 
@@ -207,7 +206,7 @@ pub async fn migrate_plaintext(db: &crate::db::Db) -> anyhow::Result<()> {
 
 #[cfg(test)]
 pub fn init_for_tests() {
-    let _ = CIPHER.set(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&[7u8; 32])));
+    let _ = CIPHER.set(Aes256Gcm::new(&Key::<Aes256Gcm>::from([7u8; 32])));
 }
 
 #[cfg(test)]
