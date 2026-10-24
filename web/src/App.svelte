@@ -24,6 +24,8 @@
   import Integrations from './pages/Integrations.svelte';
 
   let user = $state(null);
+  let version = $state('');
+  api('/auth/status').then((s) => (version = s.version)).catch(() => {});
   let ready = $state(false);
   let menuOpen = $state(false);
 
@@ -99,6 +101,7 @@
           <span class="email" title={user.email}>{user.email}</span>
           <button class="ghost icon-btn" onclick={logout} title="Log out" aria-label="Log out"><LogOut size={16} /></button>
         </div>
+        {#if version}<div class="version tiny muted">Listaculous {version}</div>{/if}
       </div>
     </aside>
 

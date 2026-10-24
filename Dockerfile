@@ -32,6 +32,8 @@ RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && cargo fetch --locked &&
 # ---- server (cross-compiled for the target platform) ----
 FROM deps AS server
 ARG TARGETARCH
+# Build version shown in the app (set by the release workflow; `dev` when unset).
+ARG LISTACULOUS_VERSION
 COPY src ./src
 COPY migrations ./migrations
 COPY openapi.yaml ./openapi.yaml
@@ -41,6 +43,7 @@ COPY openapi.yaml ./openapi.yaml
 RUN --mount=type=cache,id=lc-target-${TARGETARCH},target=/src/target \
     set -eu; \
     ulimit -n "$(ulimit -Hn)"; \
+    if [ -n "${LISTACULOUS_VERSION:-}" ]; then export LISTACULOUS_VERSION; else unset LISTACULOUS_VERSION; fi; \
     case "$TARGETARCH" in \
       amd64) TRIPLE=x86_64-unknown-linux-musl ;; \
       arm64) TRIPLE=aarch64-unknown-linux-musl ;; \

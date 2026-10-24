@@ -121,7 +121,9 @@ pub async fn status(State(st): State<AppState>) -> AppResult<Json<serde_json::Va
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
         .fetch_one(&st.db)
         .await?;
-    Ok(Json(serde_json::json!({ "needs_setup": n == 0 })))
+    Ok(Json(
+        serde_json::json!({ "needs_setup": n == 0, "version": crate::VERSION }),
+    ))
 }
 
 /// First-run setup: creates the first account + user. Only allowed while no users exist.

@@ -121,9 +121,10 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [needs_setup]
+                required: [needs_setup, version]
                 properties:
                   needs_setup: { type: boolean, description: True until the first admin account exists. }
+                  version: { type: string, description: 'Build version: `YYYY.MM.DD.HHMM` (UTC) for release images, `dev` for local builds.', example: '2026.10.23.1029' }
   /api/auth/setup:
     post:
       tags: [Auth]
