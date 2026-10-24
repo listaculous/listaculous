@@ -2,8 +2,10 @@
 //!
 //! `plan` is read-only: it inspects AWS and DNS and lists every change. `apply` (explicitly
 //! confirmed) performs them idempotently in the background, recording progress so it can be
-//! re-run safely. It never deletes or edits DNS records; existing matching records are reused,
-//! conflicting ones stop the run.
+//! re-run safely. It never edits DNS records and deletes only one kind: an SES MAIL FROM MX left
+//! by setup in another region, which it replaces when setup moves regions. Existing matching
+//! records are reused; any other conflicting one stops the run. After a region move, what the old
+//! region used is remembered so it can be cleaned up (see `cleanup`).
 //!
 //! For a site sending as `hello@news.example.com` on zone `example.com` it sets up:
 //! - an SES identity `news.example.com` with Easy DKIM (3 CNAMEs),
@@ -307,6 +309,84 @@ fn record_state(wanted: &Record, existing: &[Record]) -> (&'static str, Option<S
     }
 }
 
+/// Existing MX records at the wanted MX's name that are SES MAIL FROM endpoints for *another*
+/// region (`feedback-smtp.<region>.amazonses.com`): what setup in a previous region left behind.
+fn stale_ses_mx<'a>(wanted: &Record, existing: &'a [Record], region: &str) -> Vec<&'a Record> {
+    if wanted.kind != "MX" {
+        return Vec::new();
+    }
+    existing
+        .iter()
+        .filter(|e| {
+            let content = e.content.trim().trim_end_matches('.').to_ascii_lowercase();
+            e.kind == "MX"
+                && e.name.eq_ignore_ascii_case(&wanted.name)
+                && content
+                    .strip_prefix("feedback-smtp.")
+                    .and_then(|r| r.strip_suffix(".amazonses.com"))
+                    .is_some_and(|r| {
+                        r != region
+                            && !r.is_empty()
+                            && r.chars()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    })
+        })
+        .collect()
+}
+
+/// What to do with a wanted record: like `record_state`, except that a clash caused only by
+/// another region's SES MAIL FROM MX *that setup created* (`created_ids`) becomes "replace", unless
+/// another site sends from the same domain (`shared_with`) and may still rely on it. Returns the
+/// records to delete, and whether the wanted record must be created (it may exist already).
+fn record_plan<'a>(
+    wanted: &Record,
+    existing: &'a [Record],
+    region: &str,
+    created_ids: &[String],
+    shared_with: &[String],
+) -> (&'static str, Option<String>, Vec<&'a Record>, bool) {
+    let (state, note) = record_state(wanted, existing);
+    let stale = stale_ses_mx(wanted, existing, region);
+    if stale.is_empty() {
+        return (state, note, stale, state == "create");
+    }
+    let old: Vec<String> = stale
+        .iter()
+        .map(|r| format!("MX {} {}", r.priority.unwrap_or(0), r.content))
+        .collect();
+    let old = old.join(", ");
+    if !shared_with.is_empty() {
+        return ("conflict", Some(format!("{old} (another SES region) is also used by {}; move them together or change it by hand", shared_with.join(", "))), Vec::new(), false);
+    }
+    if stale.iter().any(|r| !created_ids.contains(&r.id)) {
+        return ("conflict", Some(format!("{old} points to another SES region but wasn't created by Listaculous; delete it if nothing else uses it, then preview again")), Vec::new(), false);
+    }
+    let rest: Vec<Record> = existing
+        .iter()
+        .filter(|e| !stale.iter().any(|s| std::ptr::eq(*s, *e)))
+        .cloned()
+        .collect();
+    match record_state(wanted, &rest) {
+        ("conflict", note) => ("conflict", note, Vec::new(), false),
+        (after, _) => (
+            "replace",
+            Some(format!("replaces {old} (MAIL FROM for another SES region)")),
+            stale,
+            after == "create",
+        ),
+    }
+}
+
+/// Provider ids of the DNS records setup has created for this site.
+fn created_record_ids(state: &Value) -> Vec<String> {
+    state["resources"]["dns_records"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r["id"].as_str().map(str::to_string))
+        .collect()
+}
+
 fn dmarc_present(existing: &[Record], t: &Target) -> bool {
     let sub = format!("_dmarc.{}", rel(&t.identity, &t.zone))
         .trim_end_matches('.')
@@ -386,6 +466,12 @@ async fn build_plan(
         None => Vec::new(),
     };
     let manual = dns_int.is_none();
+    let saved_state = load_state(st, t.site.id)
+        .await?
+        .map(|(_, s, _)| s)
+        .unwrap_or_default();
+    let created_ids = created_record_ids(&saved_state);
+    let shared = sites_sharing(st, t.site.account_id, t.site.id, &t.identity).await?;
 
     let mut steps = vec![json!({
         "id": "identity", "title": format!("Verify {} in Amazon SES (Easy DKIM)", t.identity),
@@ -397,7 +483,9 @@ async fn build_plan(
         let (state, note) = if manual {
             ("manual", None)
         } else {
-            record_state(&rec, &existing)
+            let (state, note, _, _) =
+                record_plan(&rec, &existing, &aws.region, &created_ids, &shared);
+            (state, note)
         };
         records.push(
             json!({ "group": group, "name": rec.name, "fqdn": rec.fqdn(&t.zone), "type": rec.kind,
@@ -489,10 +577,6 @@ async fn build_plan(
     let current = crate::crypto::open_config(&t.site.provider_config).unwrap_or_default();
     // "exists" only if the site already sends with the key this setup created for *this* AWS
     // account, region and identity (the config set name alone doesn't change across those).
-    let saved_state = load_state(st, t.site.id)
-        .await?
-        .map(|(_, s, _)| s)
-        .unwrap_or_default();
     let slot = &saved_state["resources"]["sender_keys"][format!("{account_id}/{}", t.iam_user)];
     let sender_done = t.site.provider_kind == "ses"
         && current["configuration_set"].as_str() == Some(t.config_set.as_str())
@@ -566,6 +650,7 @@ pub async fn apply(
         .await?
         .map(|(_, s, _)| s)
         .unwrap_or_else(|| json!({}));
+    adopt_legacy_active(&mut state, &t.site);
     state["plan"] = plan;
     state["request"] = json!({ "aws_integration_id": req.aws_integration_id, "dns_integration_id": req.dns_integration_id, "region": aws.region });
     state["steps"] = json!({});
@@ -590,6 +675,273 @@ pub async fn apply(
         }
     });
     status_json(&st, id, false, None).await.map(Json)
+}
+
+// Region moves. After each successful run, `state.active` records what the site now sends
+// through (AWS account, region, identity and what setup created for it). When a later run switches
+// the site to a different account/region/identity, the old record moves to `state.previous`, keyed
+// by `account/region/identity`, so it can be cleaned up. Returning to a previous setup takes its
+// record back. Failed runs change neither, so `previous` never describes what's sending.
+
+fn setup_key(v: &Value) -> String {
+    format!(
+        "{}/{}/{}",
+        v["aws_account_id"].as_str().unwrap_or_default(),
+        v["region"].as_str().unwrap_or_default(),
+        v["identity"].as_str().unwrap_or_default()
+    )
+}
+
+/// DKIM CNAMEs (created by setup) that belong to `identity`.
+fn dkim_records_of(records: &Value, identity: &str) -> Vec<Value> {
+    let suffix = format!("._domainkey.{identity}");
+    records
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| {
+            r["type"] == "CNAME" && r["fqdn"].as_str().is_some_and(|f| f.ends_with(&suffix))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Adds records to `into` that it doesn't have yet (by provider id, else by name).
+fn merge_records(into: &mut Value, more: &Value) {
+    let mut all = into.as_array().cloned().unwrap_or_default();
+    for r in more.as_array().into_iter().flatten() {
+        // Records with provider ids are the same only if the ids match (a replacement at the same
+        // name is a different record); without ids, by name and type.
+        let dup = all
+            .iter()
+            .any(|e| match (r["id"].as_str(), e["id"].as_str()) {
+                (Some(a), Some(b)) => a == b,
+                _ => e["fqdn"] == r["fqdn"] && e["type"] == r["type"],
+            });
+        if !dup {
+            all.push(r.clone());
+        }
+    }
+    *into = Value::Array(all);
+}
+
+/// Notes, as soon as it happens, that a run created something for a setup (identity or DKIM
+/// records), so a run that fails later doesn't lose it: the next successful one picks it up.
+fn note_owned(state: &mut Value, key: &str, identity_created: bool, dns: &[Value]) {
+    if !state["owned"].is_object() {
+        state["owned"] = json!({});
+    }
+    let o = &mut state["owned"][key];
+    if identity_created {
+        o["identity_created"] = true.into();
+    }
+    merge_records(&mut o["dns_records"], &Value::Array(dns.to_vec()));
+}
+
+/// Setups from before `state.active` existed: if the site still sends with the key the saved
+/// resources name, that's the active setup (whether setup created its identity is unknown).
+fn adopt_legacy_active(state: &mut Value, site: &Site) {
+    if state["active"].is_object() || site.provider_kind != "ses" {
+        return;
+    }
+    let r = &state["resources"];
+    let current = crate::crypto::open_config(&site.provider_config).unwrap_or_default();
+    let (Some(key), Some(region), Some(identity)) = (
+        r["access_key_id"].as_str(),
+        current["region"].as_str(),
+        state["plan"]["identity"].as_str(),
+    ) else {
+        return;
+    };
+    if current["access_key_id"].as_str() != Some(key) {
+        return;
+    }
+    state["active"] = json!({
+        "aws_account_id": r["aws_account_id"], "region": region, "identity": identity,
+        "zone": site.domain.trim().to_ascii_lowercase(),
+        "configuration_set": r["configuration_set"], "topic_arn": r["topic_arn"],
+        "iam_user": r["iam_user"], "access_key_id": key,
+        "identity_created": Value::Null,
+        "dns_records": dkim_records_of(&r["dns_records"], identity),
+    });
+}
+
+/// Records `new` as the active setup after a successful run. A re-run of the same setup keeps
+/// what it knew; a different one moves the old record to `previous`; returning to a previous one
+/// takes its record back.
+fn activate(state: &mut Value, mut new: Value) {
+    let key = setup_key(&new);
+    let absorb = |new: &mut Value, old: &Value| {
+        merge_records(&mut new["dns_records"], &old["dns_records"]);
+        // Created by setup once means it stays setup's to clean up; otherwise unknown stays unknown.
+        new["identity_created"] =
+            if new["identity_created"] == true || old["identity_created"] == true {
+                true.into()
+            } else if old["identity_created"].is_null() {
+                Value::Null
+            } else {
+                false.into()
+            };
+    };
+    // What earlier (possibly failed) runs created for this setup.
+    if let Some(owned) = state["owned"].as_object_mut().and_then(|m| m.remove(&key)) {
+        merge_records(&mut new["dns_records"], &owned["dns_records"]);
+        if owned["identity_created"] == true {
+            new["identity_created"] = true.into();
+        }
+    }
+    if let Some(prev) = state["previous"]
+        .as_object_mut()
+        .and_then(|m| m.remove(&key))
+    {
+        absorb(&mut new, &prev);
+    }
+    let old = state["active"].take();
+    if old.is_object() {
+        if setup_key(&old) == key {
+            absorb(&mut new, &old);
+        } else {
+            if !state["previous"].is_object() {
+                state["previous"] = json!({});
+            }
+            let old_key = setup_key(&old);
+            let mut old = old;
+            old["archived_at"] = now().into();
+            state["previous"][old_key] = old;
+        }
+    }
+    state["active"] = new;
+}
+
+/// Whether a previous setup's SES identity (and its DKIM records) may be removed: only if setup
+/// created it (or that's unknown, for old setups) and no other site sends from that domain.
+fn identity_removable(p: &Value, shared_with: &[String]) -> bool {
+    shared_with.is_empty() && p["identity_created"] != false
+}
+
+/// AWS CLI commands that remove what setup created for a previous setup, as one block that first
+/// checks it's signed in to that setup's AWS account (resource names repeat across accounts).
+/// The configuration set and SNS topic are per site and region: `others` are the site's other
+/// setups (active and previous), and while any of them is in the same account and region (only
+/// the sending identity differed), those two are kept for the last one's cleanup.
+fn cleanup_commands(p: &Value, others: &[&Value], shared_with: &[String]) -> Vec<String> {
+    let region = p["region"].as_str().unwrap_or_default();
+    let account = p["aws_account_id"].as_str().unwrap_or_default();
+    let same_place = others
+        .iter()
+        .any(|o| o["aws_account_id"] == p["aws_account_id"] && o["region"] == p["region"]);
+    let mut out = vec![
+        "(set -e".to_string(),
+        format!(
+            "[ \"$(aws sts get-caller-identity --query Account --output text)\" = \"{account}\" ] \
+             || {{ echo \"Sign in to AWS account {account} first\" >&2; exit 1; }}"
+        ),
+        // Already deleted (an earlier, partial run of this block, or another cleanup) is fine;
+        // any other failure stops the block.
+        "del() { out=$(\"$@\" 2>&1) && return 0; case \"$out\" in *NoSuchEntity*|*NotFoundException*|*NotFound*) echo \"already gone: $*\";; *) echo \"$out\" >&2; return 1;; esac; }".to_string(),
+    ];
+    // The old send-only key first: revoking it matters most.
+    if let Some(user) = p["iam_user"].as_str() {
+        if let Some(key) = p["access_key_id"].as_str() {
+            out.push(format!(
+                "del aws iam delete-access-key --user-name {user} --access-key-id {key}"
+            ));
+        }
+        out.push(format!(
+            "del aws iam delete-user-policy --user-name {user} --policy-name listaculous-send-only"
+        ));
+        out.push(format!("del aws iam delete-user --user-name {user}"));
+    }
+    // The identity, then its configuration set and topic: setup made that configuration set the
+    // identity's default, so they go only with the identity (SES rejects sends through an
+    // identity whose default configuration set is gone), and never while the active setup
+    // (same account and region) still uses them.
+    let identity = p["identity"].as_str().unwrap_or_default();
+    let mut group = Vec::new();
+    if !identity.is_empty() {
+        group.push(format!(
+            "del aws sesv2 delete-email-identity --email-identity {identity} --region {region}"
+        ));
+    }
+    if !same_place {
+        if let Some(cs) = p["configuration_set"].as_str() {
+            group.push(format!(
+                "del aws sesv2 delete-configuration-set --configuration-set-name {cs} --region {region}"
+            ));
+        }
+        if let Some(arn) = p["topic_arn"].as_str() {
+            group.push(format!(
+                "del aws sns delete-topic --topic-arn {arn} --region {region}"
+            ));
+        }
+    }
+    if !identity_removable(p, shared_with) {
+        out.push(format!(
+            "# Kept: {identity} in {region} and its configuration set (still used elsewhere, or not created by Listaculous)"
+        ));
+    } else if p["identity_created"].is_null() {
+        // Old setups didn't record whether they created the identity: leave that call to you.
+        out.push(format!(
+            "# Only if nothing else sends as {identity} in {region}, uncomment:"
+        ));
+        out.extend(group.into_iter().map(|c| format!("# {c}")));
+    } else {
+        out.extend(group);
+    }
+    out.push(")".into());
+    out
+}
+
+/// The site's current SES settings (`region`, `access_key_id`, …), if it sends with SES.
+async fn sending_config(st: &AppState, site_id: i64) -> AppResult<Option<Value>> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT provider_kind, provider_config FROM sites WHERE id = $1")
+            .bind(site_id)
+            .fetch_optional(&st.db)
+            .await?;
+    Ok(row.and_then(|(kind, cfg)| {
+        (kind == "ses")
+            .then(|| crate::crypto::open_config(&cfg).ok())
+            .flatten()
+    }))
+}
+
+/// Whether the site may still depend on a previous setup: it sends with that setup's key, or
+/// through that region at all (e.g. switched back by hand with another key). Conservative: such
+/// a setup is neither listed nor cleaned up.
+fn in_use(p: &Value, current: Option<&Value>) -> bool {
+    current.is_some_and(|c| {
+        (p["access_key_id"].is_string() && c["access_key_id"] == p["access_key_id"])
+            || (p["region"].is_string() && c["region"] == p["region"])
+    })
+}
+
+/// Other sites of the account that send from `identity` or a subdomain of it.
+async fn sites_sharing(
+    st: &AppState,
+    account_id: i64,
+    site_id: i64,
+    identity: &str,
+) -> AppResult<Vec<String>> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, from_email FROM sites WHERE account_id = $1 AND id <> $2")
+            .bind(account_id)
+            .bind(site_id)
+            .fetch_all(&st.db)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, from)| {
+            // Sending from the domain or any subdomain of it can rely on the identity (SES
+            // verifies subdomains through a parent domain identity).
+            from.rsplit('@').next().is_some_and(|d| {
+                let d = d.to_ascii_lowercase();
+                let identity = identity.to_ascii_lowercase();
+                d == identity || d.ends_with(&format!(".{identity}"))
+            })
+        })
+        .map(|(name, _)| name)
+        .collect())
 }
 
 async fn step(
@@ -762,6 +1114,15 @@ async fn run(
             Some(json!({ "EmailIdentity": t.identity, "ConfigurationSetName": t.config_set })),
         )
         .await;
+    // Whether this setup created the identity (so cleanup may later remove it) or found it.
+    let identity_created = created.is_ok();
+    let setup_id = setup_key(
+        &json!({ "aws_account_id": account_id, "region": aws.region, "identity": t.identity }),
+    );
+    if identity_created {
+        note_owned(state, &setup_id, true, &[]);
+        save_state(st, site_id, run_id, "running", state).await?;
+    }
     match created {
         Ok(_) => {}
         Err(e) if e.code == "AlreadyExistsException" => {
@@ -841,7 +1202,7 @@ async fn run(
     )
     .await?;
 
-    // 4. DNS records (create only; never edit or delete).
+    // 4. DNS records: create, never edit; delete only another region's SES MAIL FROM MX.
     let mut wanted: Vec<Record> = wanted_records(
         t,
         &aws.region,
@@ -851,6 +1212,7 @@ async fn run(
     .into_iter()
     .map(|(_, r)| r)
     .collect();
+    let mut dkim_created = Vec::new();
     match dns {
         Some(dns) => {
             step(st, site_id, run_id, state, "dns", "running", "").await?;
@@ -858,29 +1220,45 @@ async fn run(
             if !dmarc_present(&existing, t) {
                 wanted.push(dmarc_record());
             }
+            let created_ids = created_record_ids(state);
+            let shared = sites_sharing(st, t.site.account_id, site_id, &t.identity)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e.message))?;
             let mut created = Vec::new();
+            let mut replaced = Vec::new();
             for rec in &wanted {
-                match record_state(rec, &existing) {
-                    ("exists", _) => {}
-                    ("conflict", note) => anyhow::bail!(
+                let (action, note, stale, create) =
+                    record_plan(rec, &existing, &aws.region, &created_ids, &shared);
+                if action == "conflict" {
+                    anyhow::bail!(
                         "{} {}: {}",
                         rec.kind,
                         rec.fqdn(&t.zone),
                         note.unwrap_or_default()
-                    ),
-                    _ => {
-                        let id = dns.create(&t.zone, rec).await?;
-                        created.push(json!({ "id": id, "fqdn": rec.fqdn(&t.zone), "type": rec.kind, "content": rec.content }));
-                    }
+                    );
+                }
+                // New record first, then the old region's: a failure in between never leaves the
+                // MAIL FROM domain without an MX (a re-run removes the leftover one).
+                if create {
+                    let id = dns.create(&t.zone, rec).await?;
+                    let r = json!({ "id": id, "fqdn": rec.fqdn(&t.zone), "type": rec.kind, "content": rec.content });
+                    // Recorded right away: if a later step fails, the run's final save keeps it.
+                    merge_records(&mut state["resources"]["dns_records"], &json!([r.clone()]));
+                    note_owned(
+                        state,
+                        &setup_id,
+                        false,
+                        &dkim_records_of(&json!([r.clone()]), &t.identity),
+                    );
+                    created.push(r);
+                }
+                for old in stale {
+                    dns.delete(&t.zone, &old.id).await?;
+                    replaced.push(format!("{} {}", old.kind, old.content));
                 }
             }
             let n = created.len();
-            let mut all = state["resources"]["dns_records"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            all.extend(created);
-            state["resources"]["dns_records"] = Value::Array(all);
+            dkim_created = dkim_records_of(&Value::Array(created.clone()), &t.identity);
             step(
                 st,
                 site_id,
@@ -888,7 +1266,11 @@ async fn run(
                 state,
                 "dns",
                 "done",
-                format!("{n} record(s) created"),
+                if replaced.is_empty() {
+                    format!("{n} record(s) created")
+                } else {
+                    format!("{n} record(s) created; replaced {}", replaced.join(", "))
+                },
             )
             .await?;
         }
@@ -994,10 +1376,23 @@ async fn run(
         "configuration_set": t.config_set,
     });
     crate::crypto::seal_config(&mut cfg)?;
-    switch_site_provider(&st.db, &t.site, run_id, &cfg).await?;
-    state["resources"]["iam_user"] = t.iam_user.clone().into();
-    state["resources"]["access_key_id"] = key_id.clone().into();
-    state["resources"]["aws_account_id"] = account_id.clone().into();
+    // The site's new credentials and the record of what it now sends through are saved in one
+    // transaction, so the two can never disagree (e.g. after a crash in between).
+    let mut after = state.clone();
+    activate(
+        &mut after,
+        json!({
+            "aws_account_id": account_id, "region": aws.region, "identity": t.identity, "zone": t.zone,
+            "configuration_set": t.config_set, "topic_arn": state["resources"]["topic_arn"].clone(),
+            "iam_user": t.iam_user, "access_key_id": key_id,
+            "identity_created": identity_created, "dns_records": dkim_created,
+        }),
+    );
+    after["resources"]["iam_user"] = t.iam_user.clone().into();
+    after["resources"]["access_key_id"] = key_id.clone().into();
+    after["resources"]["aws_account_id"] = account_id.clone().into();
+    switch_site_provider(&st.db, &t.site, run_id, &cfg, &after).await?;
+    *state = after;
     step(
         st,
         site_id,
@@ -1058,15 +1453,18 @@ async fn switch_site_provider(
     site: &Site,
     run_id: &str,
     cfg: &Value,
+    state: &Value,
 ) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
-    let owned =
-        sqlx::query("UPDATE site_setups SET updated_at = $1 WHERE site_id = $2 AND run_id = $3")
-            .bind(now())
-            .bind(site.id)
-            .bind(run_id)
-            .execute(&mut *tx)
-            .await?;
+    let owned = sqlx::query(
+        "UPDATE site_setups SET updated_at = $1, state = $4 WHERE site_id = $2 AND run_id = $3",
+    )
+    .bind(now())
+    .bind(site.id)
+    .bind(run_id)
+    .bind(state.to_string())
+    .execute(&mut *tx)
+    .await?;
     if owned.rows_affected() == 0 {
         anyhow::bail!("this setup run was superseded by a newer one");
     }
@@ -1096,7 +1494,7 @@ async fn switch_site_provider(
 /// running it stopped). Each step saves progress, which renews the lease.
 const RUN_LEASE_MINUTES: i64 = 5;
 
-fn lease_cutoff() -> String {
+pub(crate) fn lease_cutoff() -> String {
     (chrono::Utc::now() - chrono::Duration::minutes(RUN_LEASE_MINUTES))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -1150,6 +1548,44 @@ async fn save_state(
     Ok(())
 }
 
+/// Setups the site moved away from that may still have resources, with how to clean them up.
+/// One the site still sends with (its key) is never listed.
+async fn previous_setups(st: &AppState, site_id: i64, state: &Value) -> AppResult<Vec<Value>> {
+    let Some(map) = state["previous"].as_object().filter(|m| !m.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let (account_id,): (i64,) = sqlx::query_as("SELECT account_id FROM sites WHERE id = $1")
+        .bind(site_id)
+        .fetch_one(&st.db)
+        .await?;
+    let current = sending_config(st, site_id).await?;
+    // Every other setup of this site, to tell which per-site resources are still shared.
+    let others = |skip: &str| -> Vec<&Value> {
+        std::iter::once(&state["active"])
+            .filter(|a| a.is_object())
+            .chain(
+                map.iter()
+                    .filter(|(k, _)| k.as_str() != skip)
+                    .map(|(_, v)| v),
+            )
+            .collect()
+    };
+    let mut out = Vec::new();
+    for (id, p) in map {
+        if in_use(p, current.as_ref()) {
+            continue;
+        }
+        let identity = p["identity"].as_str().unwrap_or_default();
+        let shared = sites_sharing(st, account_id, site_id, identity).await?;
+        out.push(json!({
+            "id": id, "region": p["region"], "identity": identity, "aws_account_id": p["aws_account_id"],
+            "dns_records": p["dns_records"], "dns_removable": identity_removable(p, &shared),
+            "shared_with": shared, "commands": cleanup_commands(p, &others(id), &shared),
+        }));
+    }
+    Ok(out)
+}
+
 async fn status_json(
     st: &AppState,
     site_id: i64,
@@ -1172,7 +1608,8 @@ async fn status_json(
             }
         }
     }
-    let mut out = json!({ "status": status, "state": state });
+    let previous = previous_setups(st, site_id, &state).await?;
+    let mut out = json!({ "status": status, "state": state, "previous_regions": previous });
     if verify {
         if let (Some(aws), Some(identity)) = (aws, state["plan"]["identity"].as_str()) {
             // A failed live check (e.g. the setup key was deleted, as recommended) must not hide
@@ -1235,6 +1672,162 @@ pub async fn status(
     status_json(&st, id, aws.is_some(), aws.as_ref())
         .await
         .map(Json)
+}
+
+// ---------------------------------------------------------------------------------------
+// Cleaning up a region setup moved away from
+
+#[derive(Deserialize)]
+pub struct CleanupRequest {
+    /// The previous setup's `id` from `previous_regions` in the status.
+    pub id: String,
+    /// Delete the setup's DNS records (that setup created) through this DNS integration.
+    #[serde(default)]
+    pub dns_integration_id: Option<i64>,
+    /// Stop listing the setup (after its AWS resources were removed).
+    #[serde(default)]
+    pub forget: bool,
+}
+
+/// Cleans up a setup the site moved away from: deletes the DNS records setup created for it
+/// (only ones that still exist unchanged, and never for an identity setup didn't create or another
+/// site uses), and/or forgets it. AWS resources are listed as commands for the user to run: the
+/// setup key isn't allowed to delete anything. Holds the site's setup lock throughout, so it can't
+/// overlap a setup run or another cleanup.
+pub async fn cleanup(
+    State(st): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(req): Json<CleanupRequest>,
+) -> AppResult<Json<Value>> {
+    let site = load_site(&st, &user, id).await?;
+    let Some((prev_status, _, prev_updated)) = load_state(&st, id).await? else {
+        return Err(AppError::not_found());
+    };
+    let busy = || {
+        AppError::new(
+            axum::http::StatusCode::CONFLICT,
+            "setup is running for this site; try again when it finishes",
+        )
+    };
+    // Claim the site's setup lock, but only from exactly the state just read, so the status
+    // restored afterwards is the one it replaced. A run abandoned mid-way is restored as an error.
+    let run_id = crate::db::random_token(12);
+    let claimed = sqlx::query(
+        "UPDATE site_setups SET status = 'running', run_id = $1, updated_at = $2 \
+         WHERE site_id = $3 AND status = $4 AND updated_at = $5 AND (status <> 'running' OR updated_at < $6)",
+    )
+    .bind(&run_id)
+    .bind(now())
+    .bind(id)
+    .bind(&prev_status)
+    .bind(&prev_updated)
+    .bind(lease_cutoff())
+    .execute(&st.db)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Err(busy());
+    }
+    let restore_status = if prev_status == "running" {
+        "error"
+    } else {
+        prev_status.as_str()
+    };
+    let result = cleanup_locked(&st, &user, &site, &req).await;
+    // Release the lock, restoring the status setup had (with the updated state on success).
+    let (mut state, out) = match result {
+        Ok((state, out)) => (state, Ok(out)),
+        Err(e) => (
+            load_state(&st, id)
+                .await?
+                .map(|(_, s, _)| s)
+                .unwrap_or_default(),
+            Err(e),
+        ),
+    };
+    if prev_status == "running" && state["error"].is_null() {
+        state["error"] = "interrupted (the server stopped mid-run); run setup again".into();
+    }
+    save_state(&st, id, &run_id, restore_status, &state)
+        .await
+        .map_err(|e| AppError::bad_request(format!("{e:#}")))?;
+    out.map(Json)
+}
+
+async fn cleanup_locked(
+    st: &AppState,
+    user: &AuthUser,
+    site: &Site,
+    req: &CleanupRequest,
+) -> AppResult<(Value, Value)> {
+    let mut state = load_state(st, site.id)
+        .await?
+        .map(|(_, s, _)| s)
+        .unwrap_or_default();
+    let entry = state["previous"][&req.id].clone();
+    if !entry.is_object() {
+        return Err(AppError::not_found());
+    }
+    if in_use(&entry, sending_config(st, site.id).await?.as_ref()) {
+        return Err(AppError::bad_request(format!(
+            "{} still sends through {}; move it to another region first",
+            site.name,
+            entry["region"].as_str().unwrap_or("this region")
+        )));
+    }
+    let mut deleted = Vec::new();
+    if let Some(dns_id) = req.dns_integration_id {
+        let identity = entry["identity"].as_str().unwrap_or_default();
+        let shared = sites_sharing(st, user.account_id, site.id, identity).await?;
+        if !identity_removable(&entry, &shared) {
+            return Err(AppError::bad_request(format!(
+                "{identity}'s DKIM records are still needed (another site sends from it, or setup didn't create it)"
+            )));
+        }
+        let dns = integrations::load(st, user, dns_id).await?.dns(&st.http)?;
+        // The zone the records were created in (the site's domain may have changed since).
+        let zone = entry["zone"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| site.domain.trim().to_ascii_lowercase());
+        let existing = dns
+            .list(&zone)
+            .await
+            .map_err(|e| AppError::bad_request(format!("{e:#}")))?;
+        let mut kept = Vec::new();
+        for r in entry["dns_records"].as_array().into_iter().flatten() {
+            let (Some(rid), Some(fqdn), Some(kind), Some(content)) = (
+                r["id"].as_str().filter(|s| !s.is_empty()),
+                r["fqdn"].as_str(),
+                r["type"].as_str(),
+                r["content"].as_str(),
+            ) else {
+                kept.push(r.clone());
+                continue;
+            };
+            // Only the exact record setup created: same id, name, type and value.
+            let unchanged = existing.iter().any(|e| {
+                e.id == rid
+                    && e.kind == kind
+                    && e.fqdn(&zone).eq_ignore_ascii_case(fqdn)
+                    && same_content(kind, &e.content, content)
+            });
+            if unchanged {
+                dns.delete(&zone, rid)
+                    .await
+                    .map_err(|e| AppError::bad_request(format!("deleting {fqdn}: {e:#}")))?;
+                deleted.push(fqdn.to_string());
+            }
+            // Gone or changed since: nothing of setup's left to delete.
+        }
+        state["previous"][&req.id]["dns_records"] = Value::Array(kept);
+    }
+    if req.forget {
+        if let Some(m) = state["previous"].as_object_mut() {
+            m.remove(&req.id);
+        }
+    }
+    Ok((state, json!({ "deleted_dns_records": deleted })))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1413,6 +2006,340 @@ mod tests {
         );
     }
 
+    fn mx(name: &str, content: &str, prio: u16) -> Record {
+        Record {
+            priority: Some(prio),
+            ..rec(name, "MX", content)
+        }
+    }
+
+    #[test]
+    fn another_regions_mail_from_mx_is_replaced() {
+        let want = mx("bounce.news", "feedback-smtp.us-east-1.amazonses.com", 10);
+        let old = mx("bounce.news", "feedback-smtp.us-west-1.amazonses.com.", 10);
+        let ours = vec![old.id.clone()];
+        let plan = |existing: &[Record], ids: &[String], shared: &[String]| {
+            let (a, n, stale, create) = record_plan(&want, existing, "us-east-1", ids, shared);
+            (a, n, stale.len(), create)
+        };
+
+        let (action, note, stale, create) = plan(std::slice::from_ref(&old), &ours, &[]);
+        assert_eq!((action, stale, create), ("replace", 1, true));
+        assert!(note.unwrap().contains("us-west-1"));
+
+        // Both regions' records present: remove the stale one, nothing to create.
+        let both = vec![old.clone(), want.clone()];
+        assert_eq!(
+            plan(&both, &ours, &[]),
+            ("replace", plan(&both, &ours, &[]).1, 1, false)
+        );
+
+        // Not created by setup, or another site sends from that domain: never touched.
+        let (action, note, ..) = plan(std::slice::from_ref(&old), &[], &[]);
+        assert_eq!(action, "conflict");
+        assert!(note.unwrap().contains("wasn't created by Listaculous"));
+        let (action, note, ..) = plan(std::slice::from_ref(&old), &ours, &["Other".to_string()]);
+        assert_eq!(action, "conflict");
+        assert!(note.unwrap().contains("Other"));
+
+        // Any other MX at that name still blocks, even next to a stale SES one.
+        let mixed = vec![old.clone(), mx("bounce.news", "mx.example.net", 20)];
+        assert_eq!(plan(&mixed, &ours, &[]).0, "conflict");
+        let fake = vec![mx("bounce.news", "feedback-smtp.evil.example.com", 10)];
+        assert_eq!(plan(&fake, &ours, &[]).0, "conflict");
+
+        // Same region, or a different name: never stale.
+        assert!(stale_ses_mx(&want, std::slice::from_ref(&want), "us-east-1").is_empty());
+        let elsewhere = mx("bounce.other", "feedback-smtp.us-west-1.amazonses.com", 10);
+        assert!(stale_ses_mx(&want, &[elsewhere], "us-east-1").is_empty());
+        // Only MX records are ever considered.
+        let txt = rec("bounce.news", "TXT", "v=spf1 include:amazonses.com ~all");
+        assert_eq!(
+            record_plan(&txt, &[old], "us-east-1", &ours, &[]).2.len(),
+            0
+        );
+    }
+
+    fn setup_rec(region: &str, key: &str, created: Value, dkim: &[&str]) -> Value {
+        json!({
+            "aws_account_id": "123", "region": region, "identity": "news.example.com",
+            "configuration_set": "cs", "topic_arn": format!("arn:aws:sns:{region}:123:t"),
+            "iam_user": format!("u-{region}"), "access_key_id": key, "identity_created": created,
+            "dns_records": dkim.iter().map(|id| json!({ "id": id, "fqdn": format!("{id}._domainkey.news.example.com"),
+                "type": "CNAME", "content": "x.dkim.amazonses.com" })).collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn region_moves_keep_track_of_previous_setups() {
+        let mut state = json!({});
+        activate(
+            &mut state,
+            setup_rec("us-west-1", "AKIAW", json!(true), &["w1"]),
+        );
+        assert!(state["previous"].is_null(), "first setup: nothing previous");
+
+        // Re-running the same setup keeps what it knew (records, created-ness).
+        activate(
+            &mut state,
+            setup_rec("us-west-1", "AKIAW", json!(false), &[]),
+        );
+        assert_eq!(state["active"]["dns_records"].as_array().unwrap().len(), 1);
+        assert_eq!(state["active"]["identity_created"], true);
+
+        // Moving: the old setup becomes previous, keyed by account/region/identity.
+        activate(
+            &mut state,
+            setup_rec("us-east-1", "AKIAE", json!(true), &["e1"]),
+        );
+        let prev = &state["previous"]["123/us-west-1/news.example.com"];
+        assert_eq!(prev["access_key_id"], "AKIAW");
+        assert_eq!(state["active"]["region"], "us-east-1");
+
+        // Moving back takes the previous record (and its DNS ids) back, and archives the other.
+        activate(
+            &mut state,
+            setup_rec("us-west-1", "AKIAW", json!(false), &[]),
+        );
+        assert!(state["previous"]["123/us-west-1/news.example.com"].is_null());
+        assert!(state["previous"]["123/us-east-1/news.example.com"].is_object());
+        assert_eq!(state["active"]["dns_records"][0]["id"], "w1");
+        assert_eq!(state["active"]["identity_created"], true);
+
+        // Same region in another AWS account is a different setup.
+        let mut other = setup_rec("us-east-1", "AKIAO", json!(true), &[]);
+        other["aws_account_id"] = "999".into();
+        activate(&mut state, other);
+        assert!(state["previous"]["123/us-east-1/news.example.com"].is_object());
+        assert!(state["previous"]["123/us-west-1/news.example.com"].is_object());
+    }
+
+    #[test]
+    fn legacy_setups_are_adopted_only_while_sending() {
+        let mut site = Site {
+            id: 1,
+            account_id: 1,
+            name: "S".into(),
+            domain: "example.com".into(),
+            from_name: "S".into(),
+            from_email: "hi@news.example.com".into(),
+            reply_to: String::new(),
+            physical_address: String::new(),
+            provider_kind: "ses".into(),
+            provider_config: json!({ "region": "us-west-1", "access_key_id": "AKIAW" }).to_string(),
+            send_rate: 1,
+            webhook_secret: "w".into(),
+            created_at: String::new(),
+            icon_type: None,
+            icon_checked_at: None,
+        };
+        let legacy = json!({
+            "plan": { "identity": "news.example.com" },
+            "resources": { "aws_account_id": "123", "iam_user": "u", "access_key_id": "AKIAW",
+                "dns_records": [{ "id": "1", "fqdn": "t._domainkey.news.example.com", "type": "CNAME", "content": "c" },
+                                { "id": "2", "fqdn": "bounce.news.example.com", "type": "TXT", "content": "spf" }] },
+        });
+        let mut state = legacy.clone();
+        adopt_legacy_active(&mut state, &site);
+        assert_eq!(state["active"]["region"], "us-west-1");
+        assert_eq!(
+            state["active"]["dns_records"].as_array().unwrap().len(),
+            1,
+            "DKIM only"
+        );
+        assert!(state["active"]["identity_created"].is_null(), "unknown");
+
+        // The site moved on to another key (e.g. a failed later run didn't switch): don't adopt.
+        site.provider_config =
+            json!({ "region": "us-west-1", "access_key_id": "AKIAX" }).to_string();
+        let mut state = legacy;
+        adopt_legacy_active(&mut state, &site);
+        assert!(state["active"].is_null());
+    }
+
+    #[test]
+    fn cleanup_spares_identities_setup_did_not_create_or_others_use() {
+        let elsewhere = setup_rec("us-east-1", "AKIAE", json!(true), &[]);
+        let mine = setup_rec("us-west-1", "AKIAW", json!(true), &["w1"]);
+        let cmds = cleanup_commands(&mine, &[&elsewhere], &[]);
+        assert_eq!(cmds.first().unwrap(), "(set -e");
+        assert!(
+            cmds[1].contains("get-caller-identity") && cmds[1].contains("\"123\""),
+            "checks the account first"
+        );
+        assert_eq!(cmds.last().unwrap(), ")");
+        let all = cmds.join("\n");
+        assert!(all.contains(
+            "delete-email-identity --email-identity news.example.com --region us-west-1"
+        ));
+        assert!(all.contains("delete-access-key --user-name u-us-west-1 --access-key-id AKIAW"));
+        assert!(
+            all.contains("delete-topic --topic-arn arn:aws:sns:us-west-1:123:t --region us-west-1")
+        );
+        assert!(
+            all.contains("delete-configuration-set --configuration-set-name cs --region us-west-1")
+        );
+        assert!(identity_removable(&mine, &[]));
+
+        // Another *previous* setup in the same account and region also keeps them (for the last).
+        let sibling = setup_rec("us-west-1", "AKIAB", json!(true), &[]);
+        let all = cleanup_commands(&mine, &[&elsewhere, &sibling], &[]).join("\n");
+        assert!(!all.contains("delete-configuration-set") && !all.contains("delete-topic"));
+        assert!(
+            all.contains("delete-email-identity"),
+            "the identity itself can still go"
+        );
+        // Same account and region, other identity: the per-site config set and topic are shared.
+        let same_place = setup_rec("us-west-1", "AKIAN", json!(true), &[]);
+        let all = cleanup_commands(&mine, &[&same_place], &[]).join("\n");
+        assert!(!all.contains("delete-configuration-set") && !all.contains("delete-topic"));
+        assert!(all.contains("delete-user --user-name u-us-west-1"));
+
+        let found = setup_rec("us-west-1", "AKIAW", json!(false), &[]);
+        assert!(!cleanup_commands(&found, &[&elsewhere], &[])
+            .join("\n")
+            .contains("delete-email-identity"));
+        assert!(!identity_removable(&found, &[]));
+
+        let shared = vec!["Other site".to_string()];
+        assert!(!cleanup_commands(&mine, &[&elsewhere], &shared)
+            .join("\n")
+            .contains("delete-email-identity"));
+        assert!(!identity_removable(&mine, &shared));
+        // A kept identity keeps its default configuration set (and topic) too.
+        let kept = cleanup_commands(&mine, &[&elsewhere], &shared).join("\n");
+        assert!(!kept.contains("delete-configuration-set") && !kept.contains("delete-topic"));
+        assert!(kept.contains("# Kept: news.example.com"));
+        assert!(
+            kept.contains("delete-user --user-name u-us-west-1"),
+            "the old key still goes"
+        );
+
+        // Unknown (old setups): the identity deletion is left commented out.
+        let unknown = setup_rec("us-west-1", "AKIAW", Value::Null, &[]);
+        let all = cleanup_commands(&unknown, &[&elsewhere], &[]).join("\n");
+        assert!(all.contains("\n# del aws sesv2 delete-email-identity"));
+        assert!(all.contains("\n# del aws sesv2 delete-configuration-set"));
+        // The key goes first; resources others may have removed don't stop the block.
+        let mine_cmds = cleanup_commands(&mine, &[&elsewhere], &[]);
+        assert!(mine_cmds[2].starts_with("del() {"));
+        assert!(mine_cmds[3].contains("delete-access-key"));
+        assert!(mine_cmds
+            .iter()
+            .any(|c| c.starts_with("del aws sesv2 delete-configuration-set")));
+    }
+
+    #[test]
+    fn replacement_records_keep_their_own_ids() {
+        // west MX (id 1) is replaced by east MX (id 2) at the same name: both ids are kept, so a
+        // later move back can recognise the east record as setup's.
+        let mut all =
+            json!([{ "id": "1", "fqdn": "bounce.news.example.com", "type": "MX", "content": "w" }]);
+        merge_records(
+            &mut all,
+            &json!([{ "id": "2", "fqdn": "bounce.news.example.com", "type": "MX", "content": "e" }]),
+        );
+        merge_records(
+            &mut all,
+            &json!([{ "id": "2", "fqdn": "bounce.news.example.com", "type": "MX", "content": "e" }]),
+        );
+        let ids: Vec<&str> = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["1", "2"]);
+        // Without ids: by name and type.
+        let mut manual = json!([{ "fqdn": "a", "type": "CNAME" }]);
+        merge_records(&mut manual, &json!([{ "fqdn": "a", "type": "CNAME" }]));
+        assert_eq!(manual.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_previous_setup_the_site_uses_again_is_protected() {
+        let west = setup_rec("us-west-1", "AKIAW", json!(true), &[]);
+        assert!(in_use(
+            &west,
+            Some(&json!({ "region": "us-west-1", "access_key_id": "AKIAW" }))
+        ));
+        // Switched back by hand with a different key: still the same region, still protected.
+        assert!(in_use(
+            &west,
+            Some(&json!({ "region": "us-west-1", "access_key_id": "AKIANEW" }))
+        ));
+        assert!(!in_use(
+            &west,
+            Some(&json!({ "region": "us-east-1", "access_key_id": "AKIAE" }))
+        ));
+        assert!(!in_use(&west, None), "not sending with SES at all");
+    }
+
+    #[tokio::test]
+    async fn provider_changes_wait_for_setup_and_cleanup() {
+        let path = std::env::temp_dir().join(format!("lc-setup-{}.db", crate::db::random_token(8)));
+        let db = crate::db::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO accounts (name, created_at) VALUES ('a', 'now')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sites (account_id, name, domain, from_name, from_email, webhook_secret, created_at) \
+                     VALUES (1, 'S', 'example.com', 'F', 'hi@news.example.com', 'w', 'now')").execute(&db).await.unwrap();
+        let update = |updated_at: String| {
+            let db = db.clone();
+            async move {
+                sqlx::query("DELETE FROM site_setups")
+                    .execute(&db)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO site_setups (site_id, status, state, run_id, updated_at) VALUES (1, 'running', '{}', 'r', $1)")
+                    .bind(updated_at).execute(&db).await.unwrap();
+                sqlx::query(crate::api::UPDATE_SITE_SQL)
+                    .bind("S")
+                    .bind("example.com")
+                    .bind("F")
+                    .bind("hi@news.example.com")
+                    .bind("")
+                    .bind("")
+                    .bind("ses")
+                    .bind(json!({ "region": "us-west-1" }).to_string())
+                    .bind(1i64)
+                    .bind(1i64)
+                    .bind(lease_cutoff())
+                    .execute(&db)
+                    .await
+                    .unwrap()
+                    .rows_affected()
+            }
+        };
+        // Setup (or a cleanup) holds the lock: the provider can't change underneath it.
+        assert_eq!(update(now()).await, 0);
+        // An abandoned run (lease expired) doesn't block.
+        assert_eq!(update("2000-01-01T00:00:00Z".into()).await, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn what_a_failed_run_created_is_kept() {
+        let mut state = json!({});
+        let key = "123/us-west-1/news.example.com";
+        // A run creates the identity and a DKIM record, then fails before switching the site.
+        let rec = json!({ "id": "9", "fqdn": "t._domainkey.news.example.com", "type": "CNAME", "content": "c" });
+        note_owned(&mut state, key, true, &[]);
+        note_owned(&mut state, key, false, &[rec]);
+        assert!(state["active"].is_null());
+        // The retry finds both already there, yet ownership carries over.
+        activate(
+            &mut state,
+            setup_rec("us-west-1", "AKIAW", json!(false), &[]),
+        );
+        assert_eq!(state["active"]["identity_created"], true);
+        assert_eq!(state["active"]["dns_records"][0]["id"], "9");
+        assert!(state["owned"][key].is_null());
+    }
+
     #[test]
     fn a_match_does_not_hide_conflicting_neighbours() {
         let mut ses_mx = rec("bounce.news", "MX", "feedback-smtp.us-east-1.amazonses.com");
@@ -1480,7 +2407,7 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
-        let err = switch_site_provider(&db, &site, "old", &cfg)
+        let err = switch_site_provider(&db, &site, "old", &cfg, &json!({}))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("superseded"), "{err}");
@@ -1495,7 +2422,7 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
-        assert!(switch_site_provider(&db, &site, "new", &cfg)
+        assert!(switch_site_provider(&db, &site, "new", &cfg, &json!({}))
             .await
             .unwrap_err()
             .to_string()
@@ -1507,7 +2434,9 @@ mod tests {
         .fetch_one(&db)
         .await
         .unwrap();
-        switch_site_provider(&db, &site, "new", &cfg).await.unwrap();
+        switch_site_provider(&db, &site, "new", &cfg, &json!({}))
+            .await
+            .unwrap();
         let (kind,): (String,) = sqlx::query_as("SELECT provider_kind FROM sites WHERE id = 1")
             .fetch_one(&db)
             .await
