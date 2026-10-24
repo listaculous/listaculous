@@ -192,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/sites/{id}/setup", get(setup::status))
         .route("/sites/{id}/setup/plan", post(setup::plan))
         .route("/sites/{id}/setup/apply", post(setup::apply))
+        .route("/sites/{id}/setup/cleanup", post(setup::cleanup))
         .route(
             "/sites/{id}/setup/production-access",
             get(setup::production_access_draft).post(setup::request_production_access),

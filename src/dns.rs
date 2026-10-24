@@ -50,6 +50,8 @@ pub trait DnsProvider: Send + Sync {
     async fn list(&self, zone: &str) -> anyhow::Result<Vec<Record>>;
     /// Creates a record and returns its provider id.
     async fn create(&self, zone: &str, record: &Record) -> anyhow::Result<String>;
+    /// Deletes the record with this provider id.
+    async fn delete(&self, zone: &str, id: &str) -> anyhow::Result<()>;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -171,6 +173,18 @@ impl DnsProvider for Porkbun {
             .as_str()
             .map(str::to_string)
             .unwrap_or_else(|| v["id"].to_string()))
+    }
+
+    async fn delete(&self, zone: &str, id: &str) -> anyhow::Result<()> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            bail!("invalid record id {id:?}");
+        }
+        self.call(
+            &format!("/dns/delete/{}/{id}", Self::zone_path(zone)?),
+            json!({}),
+        )
+        .await
+        .map(|_| ())
     }
 }
 

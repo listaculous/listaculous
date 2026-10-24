@@ -100,7 +100,11 @@ tags:
       5. If `plan.account.sandbox` is true, `GET …/production-access` for a draft, edit it, then
          `POST` it to request production access.
 
-      Setup never deletes or edits existing DNS records; conflicts stop it with an explanation.
+      Setup never edits existing DNS records, and conflicts stop it with an explanation. The one
+      exception: to move a site to another SES region, run setup with the new `region`. The plan
+      marks the old region's MAIL FROM MX record `replace`, and apply swaps it. Once the site sends
+      from the new region, `previous_regions` in the status lists what the old one still has.
+      Clean it up with `POST …/setup/cleanup` (DNS records) and the listed AWS CLI commands.
   - name: Public
     description: |
       Unauthenticated endpoints used by signup forms, confirmation/unsubscribe links and provider
@@ -466,6 +470,23 @@ paths:
                   state:
                     type: object
                     description: '`plan`, per-step `steps` ({status, detail, at}), created `resources`, and `error`.'
+                  previous_regions:
+                    type: array
+                    description: Setups (AWS account, region and identity) the site moved away from that may still have resources. One the site still sends with is never listed.
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, description: 'Pass to `…/setup/cleanup`.', example: 123456789012/us-west-1/news.example.com }
+                        region: { type: string }
+                        identity: { type: string }
+                        aws_account_id: { type: [string, 'null'] }
+                        dns_records:
+                          type: array
+                          description: The identity's DKIM records that setup created there.
+                          items: { type: object, properties: { id: { type: string }, fqdn: { type: string }, type: { type: string }, content: { type: string } } }
+                        dns_removable: { type: boolean, description: "False when setup didn't create the identity or another site sends from it: its DKIM records are kept." }
+                        shared_with: { type: array, items: { type: string }, description: Other sites sending from the same identity. }
+                        commands: { type: array, items: { type: string }, description: "Lines of one shell block that checks it's signed in to `aws_account_id`, then deletes the setup's send-only IAM user and key, its SES identity (when removable), and its configuration set and SNS topic (unless the active setup still uses them)." }
                   verification_error: { type: string, description: Set when the live verification check failed (the saved state is still returned). }
                   verification:
                     type: object
@@ -505,6 +526,35 @@ paths:
         '200': { description: Started; same shape as the status endpoint. }
         '400': { $ref: '#/components/responses/Error' }
         '409': { description: Already running., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/sites/{id}/setup/cleanup:
+    parameters: [{ $ref: '#/components/parameters/SiteId' }]
+    post:
+      tags: [Automatic setup]
+      operationId: cleanupPreviousRegion
+      summary: Clean up a region the site moved away from
+      description: |
+        With `dns_integration_id`, deletes the previous setup's DKIM records that setup created, but
+        only ones that still exist unchanged, and never while `dns_removable` is false. With
+        `forget`, stops listing it. AWS resources aren't deleted (the setup key may not delete
+        anything); run its `commands` from the status. Refused while the site still sends with it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string, description: 'The `id` from `previous_regions`.' }
+                dns_integration_id: { type: [integer, 'null'], description: Delete its DKIM records through this DNS integration. }
+                forget: { type: boolean, default: false, description: Stop listing it (after removing its AWS resources). }
+      responses:
+        '200':
+          description: Done.
+          content: { application/json: { schema: { type: object, properties: { deleted_dns_records: { type: array, items: { type: string } } } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { description: Setup is running., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
   /api/sites/{id}/setup/production-access:
     parameters: [{ $ref: '#/components/parameters/SiteId' }]
     get:
@@ -1358,7 +1408,7 @@ components:
               type: { type: string, enum: [CNAME, MX, TXT] }
               content: { type: string }
               priority: { type: [integer, 'null'] }
-              action: { type: string, enum: [create, exists, conflict, manual] }
+              action: { type: string, enum: [create, exists, replace, conflict, manual], description: '`replace`: an MX record for another SES region is deleted and this one created (moving regions).' }
               note: { type: [string, 'null'] }
         account:
           type: object

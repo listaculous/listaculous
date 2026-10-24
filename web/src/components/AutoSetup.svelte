@@ -12,6 +12,7 @@
   import Send from '@lucide/svelte/icons/send';
   import { api, fmtDate } from '../api.js';
   import Alert from './Alert.svelte';
+  import CodeBlock from './CodeBlock.svelte';
 
   // `returnTo`: route the Integrations page links back to (for flows that send the user there).
   let { site, onApplied, onStatus, returnTo = '' } = $props();
@@ -31,6 +32,21 @@
   let poll;
   let destroyed = false;
   onDestroy(() => { destroyed = true; clearTimeout(poll); });
+
+  // Regions where SES (API v2) is available.
+  const SES_REGIONS = [
+    ['us-east-1', 'US East (N. Virginia)'], ['us-east-2', 'US East (Ohio)'], ['us-west-1', 'US West (N. California)'],
+    ['us-west-2', 'US West (Oregon)'], ['ca-central-1', 'Canada (Central)'], ['ca-west-1', 'Canada West (Calgary)'],
+    ['sa-east-1', 'South America (São Paulo)'], ['eu-west-1', 'Europe (Ireland)'], ['eu-west-2', 'Europe (London)'],
+    ['eu-west-3', 'Europe (Paris)'], ['eu-central-1', 'Europe (Frankfurt)'], ['eu-central-2', 'Europe (Zurich)'],
+    ['eu-south-1', 'Europe (Milan)'], ['eu-north-1', 'Europe (Stockholm)'], ['il-central-1', 'Israel (Tel Aviv)'],
+    ['me-south-1', 'Middle East (Bahrain)'], ['me-central-1', 'Middle East (UAE)'], ['af-south-1', 'Africa (Cape Town)'],
+    ['ap-south-1', 'Asia Pacific (Mumbai)'], ['ap-south-2', 'Asia Pacific (Hyderabad)'], ['ap-northeast-1', 'Asia Pacific (Tokyo)'],
+    ['ap-northeast-2', 'Asia Pacific (Seoul)'], ['ap-northeast-3', 'Asia Pacific (Osaka)'], ['ap-southeast-1', 'Asia Pacific (Singapore)'],
+    ['ap-southeast-2', 'Asia Pacific (Sydney)'], ['ap-southeast-3', 'Asia Pacific (Jakarta)'], ['ap-southeast-5', 'Asia Pacific (Malaysia)'],
+  ];
+  // The region the site sends through now (when it uses SES): choosing another one moves it.
+  let sendingRegion = $derived(site.provider_kind === 'ses' ? site.provider_config?.region || '' : '');
 
   const body = () => ({ aws_integration_id: Number(awsId), dns_integration_id: dnsId ? Number(dnsId) : null, region: region || null });
 
@@ -115,8 +131,12 @@
 
   async function applyNow() {
     const n = plan.records.filter((r) => r.action === 'create').length;
-    const dnsText = plan.dns === 'automatic' ? `add ${n} DNS record(s) to ${plan.zone}` : 'leave DNS to you';
-    if (!confirm(`Set up ${plan.identity} in Amazon SES (${plan.region}), ${dnsText}, and switch ${site.name} to a new send-only key?`)) return;
+    const replaced = plan.records.filter((r) => r.action === 'replace').length;
+    const dnsText = plan.dns === 'automatic'
+      ? `add ${n} DNS record(s)${replaced ? ` and replace ${replaced} for the old region` : ''} in ${plan.zone}`
+      : 'leave DNS to you';
+    const move = sendingRegion && sendingRegion !== plan.region ? ` (moving it from ${sendingRegion})` : '';
+    if (!confirm(`Set up ${plan.identity} in Amazon SES (${plan.region}), ${dnsText}, and switch ${site.name} to a new send-only key${move}?`)) return;
     busy = true;
     error = '';
     // The server may start provisioning before the request returns: report running until it
@@ -153,6 +173,30 @@
     }
     lastStatus = status;
   });
+
+  // Cleaning up a region the site moved away from. With DNS: deletes the old DKIM records setup
+  // created; either way, forgets the region. AWS resources are removed with the listed commands.
+  let cleanupMsg = $state('');
+  async function cleanup(prev, deleteDns) {
+    const what = deleteDns
+      ? `Delete ${prev.dns_records.filter((r) => r.id).length} old ${prev.region} DKIM record(s) from ${site.domain}?`
+      : `Stop listing ${prev.region}? Do this after you've removed its AWS resources.`;
+    if (!confirm(what)) return;
+    busy = true;
+    error = cleanupMsg = '';
+    try {
+      const r = await api(`/sites/${site.id}/setup/cleanup`, {
+        method: 'POST',
+        body: deleteDns ? { id: prev.id, dns_integration_id: Number(dnsId) } : { id: prev.id, forget: true },
+      });
+      cleanupMsg = deleteDns ? `Deleted ${r.deleted_dns_records.length} DNS record(s).` : `${prev.region} cleared.`;
+      await refresh();
+    } catch (err) {
+      error = err.message;
+    } finally {
+      busy = false;
+    }
+  }
 
   async function loadDraft() {
     draft = await api(`/sites/${site.id}/setup/production-access`);
@@ -229,6 +273,32 @@
   {/if}
 
 
+  {#if cleanupMsg}<Alert kind="ok">{cleanupMsg}</Alert>{/if}
+  {#each setup.previous_regions ?? [] as prev (prev.id)}
+    {@const deletable = prev.dns_records.filter((r) => r.id)}
+    <div class="card flush" style="margin:0 0 16px;box-shadow:none;padding:14px 16px">
+      <h3 style="margin-bottom:4px">Clean up {prev.region}</h3>
+      <p class="small muted">{site.name} no longer sends through {prev.region}, but its old setup there is still in place. Remove it so the old send-only key can't be used.</p>
+      {#if prev.shared_with.length}
+        <p class="small muted">{prev.identity} is also used by {prev.shared_with.join(', ')}, so its SES identity and DKIM records stay.</p>
+      {/if}
+      {#if prev.dns_records.length && prev.dns_removable}
+        <div class="small" style="margin:10px 0 4px"><strong>DNS records</strong> (old DKIM)</div>
+        <ul class="small" style="margin:0 0 8px;padding-left:18px">
+          {#each prev.dns_records as r, i (r.id ?? `${r.fqdn}#${i}`)}<li><code style="word-break:break-all">{r.type} {r.fqdn} → {r.content}</code></li>{/each}
+        </ul>
+        {#if deletable.length && dnsId}
+          <button class="secondary" onclick={() => cleanup(prev, true)} disabled={busy}>Delete these DNS records</button>
+        {:else}
+          <p class="small muted">Delete these at your DNS host.</p>
+        {/if}
+      {/if}
+      <div class="small" style="margin:12px 0 4px"><strong>AWS resources</strong> in account {prev.aws_account_id}: run this with the AWS CLI, signed in to that account (your setup key isn't allowed to delete anything). It checks the account first.</div>
+      <CodeBlock code={prev.commands.join('\n')} />
+      <div class="actions" style="margin-top:8px"><button class="ghost" onclick={() => cleanup(prev, false)} disabled={busy}>Done — stop listing {prev.region}</button></div>
+    </div>
+  {/each}
+
   {#if !hasAws}
     <Alert kind="info">Connect an AWS account (and optionally Porkbun) on the <a href="#/integrations{returnTo ? `?return=${returnTo}` : ''}">Integrations</a> page to enable automatic setup.</Alert>
   {:else}
@@ -245,8 +315,20 @@
           <option value="">I'll add DNS records myself</option>
         </select>
       </label>
-      <label class="field">SES region <input bind:value={region} oninput={selectionChanged} disabled={busy} placeholder="us-east-1" autocomplete="off" data-bwignore /></label>
+      <label class="field">SES region
+        <select bind:value={region} onchange={selectionChanged} disabled={busy}>
+          {#if region && !SES_REGIONS.some(([r]) => r === region)}<option value={region}>{region}</option>{/if}
+          {#each SES_REGIONS as [r, label] (r)}<option value={r}>{r} · {label}</option>{/each}
+        </select>
+      </label>
     </div>
+    {#if sendingRegion && region && region !== sendingRegion}
+      <Alert kind="info">
+        This moves {site.name} from <strong>{sendingRegion}</strong> to <strong>{region}</strong>. Setup creates everything in {region},
+        replaces the region-specific MAIL FROM record, then switches sending over. {sendingRegion} keeps working until then.
+        SES sandbox status and verified addresses are separate for each region.
+      </Alert>
+    {/if}
 
     {#if plan}
       <div class="card flush" style="margin:8px 0 16px;box-shadow:none">
@@ -273,7 +355,7 @@
                   <td><code style="word-break:break-all">{r.fqdn ?? r.name}</code></td>
                   <td>{r.type}</td>
                   <td><code style="word-break:break-all">{r.priority ? `${r.priority} ` : ''}{r.content}</code>{#if r.note}<div class="small muted">{r.note}</div>{/if}</td>
-                  <td><span class="badge {r.action === 'exists' ? 'confirmed' : r.action === 'conflict' ? 'failed' : r.action === 'manual' ? 'pending' : 'sending'}">{r.action}</span></td>
+                  <td><span class="badge {r.action === 'exists' ? 'confirmed' : r.action === 'conflict' ? 'failed' : r.action === 'manual' || r.action === 'replace' ? 'pending' : 'sending'}">{r.action}</span></td>
                 </tr>
               {/each}
             </tbody>

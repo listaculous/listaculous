@@ -237,12 +237,15 @@ pub async fn create_site(
 
 /// Updates a site. The CASEs compare against the row's *current* domain inside the statement, so a
 /// domain change atomically drops the old icon and marks it unchecked, whatever other saves race it.
+/// Refused (no row updated) while automatic setup or a cleanup holds the site's setup lock ($11 =
+/// the lease cutoff), since those decide what's safe to change or delete from settings they read.
 pub(crate) const UPDATE_SITE_SQL: &str =
     "UPDATE sites SET name=$1, domain=$2, from_name=$3, from_email=$4, reply_to=$5, \
      physical_address=$6, provider_kind=$7, provider_config=$8, send_rate=$9, \
      icon_data = CASE WHEN domain = $2 THEN icon_data ELSE NULL END, \
      icon_type = CASE WHEN domain = $2 THEN icon_type ELSE NULL END, \
-     icon_checked_at = CASE WHEN domain = $2 THEN icon_checked_at ELSE NULL END WHERE id=$10";
+     icon_checked_at = CASE WHEN domain = $2 THEN icon_checked_at ELSE NULL END WHERE id=$10 \
+     AND NOT EXISTS (SELECT 1 FROM site_setups WHERE site_id = $10 AND status = 'running' AND updated_at >= $11)";
 
 pub(crate) async fn site_needs_icon(db: &crate::db::Db, id: i64) -> AppResult<bool> {
     let (checked,): (Option<String>,) =
@@ -263,7 +266,7 @@ pub async fn update_site(
     i.validate()?;
     i.merge_secrets(&existing.provider_config);
     crate::crypto::seal_config(&mut i.provider_config)?;
-    sqlx::query(UPDATE_SITE_SQL)
+    let affected = sqlx::query(UPDATE_SITE_SQL)
         .bind(&i.name)
         .bind(&i.domain)
         .bind(&i.from_name)
@@ -274,8 +277,16 @@ pub async fn update_site(
         .bind(i.provider_config.to_string())
         .bind(i.send_rate)
         .bind(id)
+        .bind(crate::setup::lease_cutoff())
         .execute(&st.db)
-        .await?;
+        .await?
+        .rows_affected();
+    if affected == 0 {
+        return Err(AppError::new(
+            axum::http::StatusCode::CONFLICT,
+            "automatic setup is running for this site; save these settings when it finishes",
+        ));
+    }
     // Decide from the row as written (not our earlier read, which a concurrent save may have
     // made stale): an unchecked icon means the domain changed and the icon needs fetching.
     if site_needs_icon(&st.db, id).await? {
@@ -982,6 +993,7 @@ mod tests {
             .bind("{}")
             .bind(10_i64)
             .bind(1_i64)
+            .bind(crate::setup::lease_cutoff())
             .execute(db)
             .await
             .unwrap();
