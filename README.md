@@ -15,6 +15,7 @@ Lightweight, self-hosted newsletter manager. Rust + Svelte + SQLite (or Postgres
   - Automatic **bounce & complaint suppression** via SES → SNS webhook
   - Honeypot + per-IP rate limiting on signup; identical responses so list membership can't be probed
   - Suppressed addresses can't be re-added by forms or imports
+- **Email courses** (drip sequences): lessons sent automatically on day N after each subscriber confirms
 - Campaign editor with live preview, test sends, rate-limited background sending that resumes after restarts, pause/resume
 - CSV import/export, subscriber search
 
@@ -72,6 +73,16 @@ For Porkbun, create an API key and turn on **API Access** for each domain Listac
 4. Site → *Settings & sending* shows a webhook URL. Create an SNS topic, add an HTTPS subscription to that URL (auto-confirmed), and point SES Bounce + Complaint notifications at the topic.
 5. Set the send rate to your SES per-second quota.
 6. Create a newsletter, paste the signup form from the *Signup form* tab into your site.
+
+## Email courses
+
+A newsletter's **Email course** tab sends each new subscriber a series of lessons, e.g. a 7-day course: **Create a 7-day course** makes lessons for day 0–6, you write them in the normal editor, then **Start course**.
+
+- Everyone who confirms *after* the course starts is enrolled. Subscribers you already had and CSV imports are not, so starting a course never blasts your existing list.
+- Lessons go out on day N after the person confirmed, at the time of day they signed up (day 0 right away). They use the same sender as campaigns: rate limits, retries, unsubscribe footer, link domain.
+- Lessons stay editable while the course runs; the next send uses what's saved. A lesson added later only reaches people who haven't passed its day. Unwritten lessons hold subscribers at that point until written.
+- Unsubscribing stops the lessons; resubscribing resumes where they left off. **Pause** stops all lessons; people who sign up meanwhile are enrolled when you resume.
+- If a lesson keeps failing to send, it pauses itself (shown on the course) and subscribers wait there until you resume it.
 
 ## Custom link domains
 

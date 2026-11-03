@@ -22,7 +22,7 @@
 
   let c = $state(null);
   let list = $state(null);
-  let f = $state({ subject: '', preheader: '', html_body: '', text_body: '' });
+  let f = $state({ subject: '', preheader: '', html_body: '', text_body: '', delay_days: 0 });
   let preview = $state({ html: '', text: '' });
   let view = $state('html');
   let testEmail = $state('');
@@ -38,25 +38,35 @@
   let device = $state('desktop');
   let htmlArea = $state();
 
+  // Bumped by every edit and save: a poll that started before one must not overwrite the form
+  // (or `c`) with what it read, since that may predate the save.
+  let gen = 0;
   async function load() {
     try {
-      c = await api(`/campaigns/${id}`);
-      list ??= await api(`/lists/${c.list_id}`);
-      if (!dirty) f = { subject: c.subject, preheader: c.preheader, html_body: c.html_body, text_body: c.text_body };
+      const started = gen;
+      const fresh = await api(`/campaigns/${id}`);
+      list ??= await api(`/lists/${fresh.list_id}`);
+      if (started !== gen || saving) return;
+      c = fresh;
+      if (!dirty) f = { subject: c.subject, preheader: c.preheader, html_body: c.html_body, text_body: c.text_body, delay_days: c.delay_days };
     } catch (err) {
       error = `Couldn't refresh campaign: ${err.message}`;
     } finally {
       // Keep polling while sending (also after a transient error) until the page is left.
       clearTimeout(poll);
-      if ((!c || c.status === 'sending') && !destroyed) poll = setTimeout(load, c ? 2000 : 5000);
+      // Live course lessons refresh more slowly (counts change and the sender may pause one).
+      if ((!c || c.status === 'sending') && !destroyed) poll = setTimeout(load, !c ? 5000 : c.sequence_id ? 10000 : 2000);
     }
   }
   load().then(refreshPreview);
   onDestroy(() => { destroyed = true; clearTimeout(timer); clearTimeout(poll); });
 
-  let editable = $derived(c?.status === 'draft');
+  // Email-course lessons are always editable; the next send uses whatever is saved.
+  let lesson = $derived(!!c?.sequence_id);
+  let editable = $derived(c?.status === 'draft' || lesson);
 
   function changed() {
+    gen++;
     rev++;
     clearTimeout(timer);
     timer = setTimeout(refreshPreview, 400);
@@ -84,7 +94,9 @@
     saving = true;
     try {
       const submitted = rev;
+      gen++;
       c = await api(`/campaigns/${id}`, { method: 'PUT', body: $state.snapshot(f) });
+      gen++;
       savedRev = submitted;
       msg = 'Saved.';
       return true;
@@ -130,14 +142,20 @@
     } catch (err) { error = err.message; }
   }
 
+  // Saves pending edits first, so the queue resumes with the content and day on screen.
+  async function resumeLesson() {
+    if (!(await saveLatest())) return;
+    await retry();
+  }
+
   async function pause() {
     c = await api(`/campaigns/${id}/pause`, { method: 'POST' });
   }
 
   async function remove() {
-    if (!confirm('Delete this campaign?')) return;
+    if (!confirm(lesson ? 'Delete this lesson? Subscribers who haven\'t reached it yet will skip it.' : 'Delete this campaign?')) return;
     await api(`/campaigns/${id}`, { method: 'DELETE' });
-    go(`/lists/${c.list_id}/campaigns`);
+    go(`/lists/${c.list_id}/${lesson ? 'course' : 'campaigns'}`);
   }
 
   const placeholders = ['{{name}}', '{{email}}', '{{list_name}}', '{{site_name}}', '{{unsubscribe_url}}'];
@@ -156,17 +174,20 @@
 {#if c}
   <div class="crumbs">
     <a href="#/">Dashboard</a><ChevronRight size={14} />
-    {#if list}<a href="#/sites/{list.site_id}">{list.site.name}</a><ChevronRight size={14} /><a href="#/lists/{list.id}/campaigns">{list.name}</a><ChevronRight size={14} />{/if}
-    <span>Campaign</span>
+    {#if list}<a href="#/sites/{list.site_id}">{list.site.name}</a><ChevronRight size={14} /><a href="#/lists/{list.id}/{lesson ? 'course' : 'campaigns'}">{list.name}</a><ChevronRight size={14} />{/if}
+    <span>{lesson ? 'Email course lesson' : 'Campaign'}</span>
   </div>
   <div class="page-head">
     <div>
-      <h1>{f.subject || 'Untitled campaign'}</h1>
-      <p class="sub"><span class="badge {c.status}">{c.status}</span>
+      <h1>{f.subject || (lesson ? 'Untitled lesson' : 'Untitled campaign')}</h1>
+      <p class="sub">{#if lesson}<span class="badge">Day {c.delay_days}</span>{#if c.status === 'paused'} <span class="badge paused">paused</span>{/if}{:else}<span class="badge {c.status}">{c.status}</span>{/if}
         {#if editable}{dirty ? (saving ? 'Saving…' : 'Unsaved changes') : 'All changes saved'}{:else}Started {fmtDate(c.started_at)}{/if}</p>
     </div>
     <div class="actions">
-      {#if editable}
+      {#if lesson}
+        <button class="secondary" onclick={save} disabled={!dirty || saving}><Save size={16} /> Save lesson</button>
+        {#if c.status === 'paused'}<button onclick={resumeLesson}><Play size={16} /> Resume sending</button>{/if}
+      {:else if editable}
         <button class="secondary" onclick={save} disabled={!dirty || saving}><Save size={16} /> Save draft</button>
         <button class="primary-grad" onclick={send}><Send size={16} /> Send now…</button>
       {:else if c.status === 'sending'}
@@ -182,7 +203,20 @@
   {#if msg}<Alert kind="ok">{msg}</Alert>{/if}
   {#if error}<Alert kind="error">{error}</Alert>{/if}
 
-  {#if c.status !== 'draft'}
+  {#if lesson}
+    <div class="card">
+      <div class="card-head"><h2>Delivery</h2><span class="small muted">Sent automatically on day {c.delay_days} after each subscriber confirms</span></div>
+      <div class="grid">
+        <div class="stat ok"><div class="stat-icon"><CircleCheck size={18} /></div><div class="stat-label">Sent</div><div class="stat-value">{c.stats.sent.toLocaleString()}</div></div>
+        <div class="stat"><div class="stat-icon"><Users size={18} /></div><div class="stat-label">Queued</div><div class="stat-value">{(c.stats.total - c.stats.sent - c.stats.failed - c.stats.skipped).toLocaleString()}</div></div>
+        <div class="stat danger"><div class="stat-icon"><CircleX size={18} /></div><div class="stat-label">Failed</div><div class="stat-value">{c.stats.failed.toLocaleString()}</div></div>
+        <div class="stat warn"><div class="stat-icon"><SkipForward size={18} /></div><div class="stat-label">Skipped</div><div class="stat-value">{c.stats.skipped.toLocaleString()}</div></div>
+      </div>
+      {#if c.status === 'paused'}
+        <p class="small" style="color:var(--danger);margin:14px 0 0">Paused after repeated send failures; subscribers wait at this lesson. Fix the provider, then resume.</p>
+      {/if}
+    </div>
+  {:else if c.status !== 'draft'}
     <div class="card">
       <div class="card-head"><h2>Delivery</h2><span class="small muted">{pct}% complete{#if c.finished_at} · finished {fmtDate(c.finished_at)}{/if}</span></div>
       <div class="progress" style="height:10px;margin-bottom:18px"><div style="width:{pct}%"></div></div>
@@ -200,6 +234,10 @@
 
   <div class="split">
     <div class="card">
+      {#if lesson}
+        <label class="field">Send on day <input type="number" min="0" max="3650" bind:value={f.delay_days} oninput={changed} style="max-width:120px" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" />
+          <span class="hint">Days after the subscriber confirms. Day 0 goes right away.</span></label>
+      {/if}
       <label class="field">Subject <input bind:value={f.subject} oninput={changed} disabled={!editable} placeholder="What's new this week" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
       <label class="field">Preheader <span class="muted">(inbox preview text)</span>
         <input bind:value={f.preheader} oninput={changed} disabled={!editable} placeholder="A one-line teaser shown after the subject" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" /></label>
@@ -218,7 +256,7 @@
       <p class="hint" style="margin:0">An unsubscribe footer and your mailing address are always added automatically.</p>
       {#if editable}
         <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
-          <button class="danger" onclick={remove}><Trash2 size={15} /> Delete draft</button>
+          <button class="danger" onclick={remove}><Trash2 size={15} /> {lesson ? 'Delete lesson' : 'Delete draft'}</button>
         </div>
       {/if}
     </div>

@@ -5,6 +5,7 @@ mod aws;
 mod crypto;
 mod db;
 mod dns;
+mod drip;
 mod error;
 mod favicon;
 mod integrations;
@@ -222,6 +223,12 @@ async fn main() -> anyhow::Result<()> {
             "/lists/{id}/campaigns",
             get(api::list_campaigns).post(api::create_campaign),
         )
+        .route("/lists/{id}/sequences", get(drip::list).post(drip::create))
+        .route(
+            "/sequences/{id}",
+            get(drip::get).put(drip::update).delete(drip::delete),
+        )
+        .route("/sequences/{id}/lessons", post(drip::add_lesson))
         .route("/subscriptions/{id}", delete(api::delete_subscription))
         .route(
             "/subscriptions/{id}/unsubscribe",
