@@ -16,6 +16,9 @@ pub struct Site {
     pub send_rate: i64,
     pub webhook_secret: String,
     pub created_at: String,
+    /// Custom origin for subscriber-facing links (confirm, unsubscribe, signup endpoint), e.g.
+    /// `https://newsletter.example.com`. Empty = the server's BASE_URL.
+    pub public_url: String,
     /// MIME type of the stored favicon; None when the site has no icon.
     #[serde(skip)]
     pub icon_type: Option<String>,
@@ -26,12 +29,21 @@ pub struct Site {
 
 pub const SITE_COLS: &str =
     "id, account_id, name, domain, from_name, from_email, reply_to, physical_address, \
-    provider_kind, provider_config, send_rate, webhook_secret, created_at, icon_type, icon_checked_at";
+    provider_kind, provider_config, send_rate, webhook_secret, created_at, public_url, icon_type, icon_checked_at";
 
 /// Keys inside provider_config that are secrets and never returned to the browser.
 pub const SECRET_KEYS: &[&str] = crate::crypto::SECRET_FIELDS;
 
 impl Site {
+    /// Origin used for this site's subscriber-facing links.
+    pub fn link_base<'a>(&'a self, base_url: &'a str) -> &'a str {
+        if self.public_url.is_empty() {
+            base_url
+        } else {
+            &self.public_url
+        }
+    }
+
     pub fn masked_provider_config(&self) -> serde_json::Value {
         let mut v: serde_json::Value =
             serde_json::from_str(&self.provider_config).unwrap_or_default();
@@ -96,7 +108,7 @@ pub fn render_campaign(
     r: &Recipient,
 ) -> crate::mailer::OutgoingEmail {
     use crate::mailer::{html_escape, html_to_text};
-    let unsub = format!("{base_url}/unsubscribe/{}", r.token);
+    let unsub = format!("{}/unsubscribe/{}", site.link_base(base_url), r.token);
     let sub = |s: &str, escape: bool| {
         let e = |v: &str| {
             if escape {

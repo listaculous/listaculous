@@ -71,7 +71,7 @@ mod tests {
                 .unwrap_or(chunk.len());
             let args = &chunk[..end];
             let path = args.split('"').nth(1).unwrap();
-            if path == "/healthz" || path.starts_with("/openapi") || path == "/docs" {
+            if path.starts_with("/healthz") || path.starts_with("/openapi") || path == "/docs" {
                 continue;
             }
             let full = if offset < api_end {

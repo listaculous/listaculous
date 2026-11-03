@@ -337,7 +337,7 @@ async fn send_confirmation(
     name: &str,
     token: &str,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/confirm/{token}", st.cfg.base_url);
+    let url = format!("{}/confirm/{token}", site.link_base(&st.cfg.base_url));
     let html = format!(
         r#"<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;font-size:16px;color:#222">
 <p>Please confirm your subscription to <strong>{list}</strong> from {site}.</p>

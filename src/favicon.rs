@@ -226,7 +226,7 @@ fn is_public(ip: IpAddr) -> bool {
 }
 
 /// Resolves the URL's host and returns one public address to pin the request to.
-async fn public_addr(url: &Url) -> anyhow::Result<SocketAddr> {
+pub(crate) async fn public_addr(url: &Url) -> anyhow::Result<SocketAddr> {
     let host = url.host_str().ok_or_else(|| anyhow!("no host"))?;
     let port = url
         .port_or_known_default()

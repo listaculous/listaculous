@@ -13,7 +13,7 @@
   const showProvider = $derived(sections !== 'details');
 
   const blank = {
-    name: '', domain: '', from_name: '', from_email: '', reply_to: '', physical_address: '',
+    name: '', domain: '', from_name: '', from_email: '', reply_to: '', physical_address: '', public_url: '',
     provider_kind: 'ses', provider_config: {}, send_rate: 10,
   };
   // The form edits a copy of the site as it was when opened.
@@ -71,6 +71,11 @@
   <label class="field">Physical mailing address
     <textarea rows="2" bind:value={f.physical_address} placeholder="123 Main St, Springfield, UT 84000, USA" style="font-family:var(--font)"></textarea>
     <span class="hint">Required by CAN-SPAM and shown in every email footer. A PO box or registered agent address is fine.</span>
+  </label>
+  <label class="field">Link domain <span class="muted">(optional)</span>
+    <input bind:value={f.public_url} placeholder="newsletter.example.com" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" />
+    <span class="hint">Confirm and unsubscribe links (and the signup form endpoint) use this domain instead of the Listaculous server's.
+      Point it at this server (e.g. a CNAME) and add it to your reverse proxy so it gets an HTTPS certificate. Leave blank to use the default.</span>
   </label>
   {/if}
 

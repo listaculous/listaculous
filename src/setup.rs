@@ -2130,6 +2130,7 @@ mod tests {
             send_rate: 1,
             webhook_secret: "w".into(),
             created_at: String::new(),
+            public_url: String::new(),
             icon_type: None,
             icon_checked_at: None,
         };
@@ -2308,6 +2309,7 @@ mod tests {
                     .bind(1i64)
                     .bind(1i64)
                     .bind(lease_cutoff())
+                    .bind("")
                     .execute(&db)
                     .await
                     .unwrap()

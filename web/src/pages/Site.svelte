@@ -11,6 +11,7 @@
   import { nav, refreshNav } from '../stores.svelte.js';
   import SiteIcon from '../components/SiteIcon.svelte';
   import AutoSetup from '../components/AutoSetup.svelte';
+  import LinkDomain from '../components/LinkDomain.svelte';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import SiteForm from './SiteForm.svelte';
   import Alert from '../components/Alert.svelte';
@@ -146,6 +147,7 @@
     {/if}
   {:else if tab === 'settings'}
     <div class="card"><SiteForm {site} onSaved={(s) => { site = s; refreshNav(); }} /></div>
+    {#if site.public_url}{#key site.public_url}<LinkDomain {site} />{/key}{/if}
     <div class="card">
       <div class="card-head"><div style="display:flex;gap:14px;align-items:center"><SiteIcon {site} size={40} radius={10} />
         <div><h2>Site icon</h2><p class="muted small">Fetched automatically from {site.domain}'s favicon. Re-fetch after changing it on your site.</p></div></div>
