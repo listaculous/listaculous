@@ -17,7 +17,7 @@ use crate::AppState;
 
 type J = AppResult<Json<Value>>;
 
-async fn site_for(st: &AppState, u: &AuthUser, id: i64) -> AppResult<Site> {
+pub(crate) async fn site_for(st: &AppState, u: &AuthUser, id: i64) -> AppResult<Site> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {SITE_COLS} FROM sites WHERE id = $1 AND account_id = $2"
     )))
@@ -55,6 +55,7 @@ async fn campaign_for(st: &AppState, u: &AuthUser, id: i64) -> AppResult<(Campai
 fn site_json(s: &Site, base_url: &str) -> Value {
     let mut v = serde_json::to_value(s).unwrap();
     v["provider_config"] = s.masked_provider_config();
+    v["links_url"] = s.link_base(base_url).into();
     v["webhook_url"] = format!("{base_url}/webhooks/ses/{}/{}", s.id, s.webhook_secret).into();
     // Relative, cache-busted by the fetch time so a refreshed icon shows immediately.
     v["icon_url"] = match &s.icon_type {
@@ -117,6 +118,9 @@ pub struct SiteInput {
     pub reply_to: String,
     #[serde(default)]
     pub physical_address: String,
+    /// Custom origin for confirm/unsubscribe/signup links; blank = BASE_URL.
+    #[serde(default)]
+    pub public_url: String,
     #[serde(default = "default_provider")]
     pub provider_kind: String,
     #[serde(default)]
@@ -165,6 +169,7 @@ impl SiteInput {
             self.provider_config = json!({});
         }
         self.send_rate = self.send_rate.clamp(1, 500);
+        self.public_url = normalize_public_url(&self.public_url)?;
         Ok(())
     }
 
@@ -182,6 +187,58 @@ impl SiteInput {
             }
         }
     }
+}
+
+/// Accepts `newsletter.example.com` or a full `https://` origin and returns `https://host[:port]`
+/// (blank stays blank). Paths, queries and credentials are refused; `http://` only for localhost.
+fn normalize_public_url(raw: &str) -> AppResult<String> {
+    let raw = raw.trim().trim_end_matches('/');
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+    let with_scheme = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    let bad = || {
+        AppError::bad_request(
+            "link domain must be a hostname such as newsletter.example.com (no path)",
+        )
+    };
+    let mut u = url::Url::parse(&with_scheme).map_err(|_| bad())?;
+    let host = u
+        .host_str()
+        .ok_or_else(bad)?
+        .trim_end_matches('.')
+        .to_string();
+    u.set_host(Some(&host)).map_err(|_| bad())?;
+    let host = host.as_str();
+    // `Url` lets through characters such as quotes; links are interpolated into HTML and code
+    // snippets, so allow only DNS hostname syntax (IDNs arrive here already as `xn--` labels).
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    if host.len() > 253 || !host.split('.').all(label_ok) {
+        return Err(bad());
+    }
+    let local = host == "localhost" || host == "127.0.0.1";
+    if !(u.scheme() == "https" || (u.scheme() == "http" && local))
+        || !u.username().is_empty()
+        || u.password().is_some()
+        || u.path() != "/"
+        || u.query().is_some()
+        || u.fragment().is_some()
+        // Certificates are issued (and Caddy's on-demand `ask` matched) by hostname alone.
+        || (!local && (u.port().is_some() || !host.contains('.')))
+    {
+        return Err(bad());
+    }
+    Ok(u.origin().ascii_serialization())
 }
 
 pub async fn list_sites(State(st): State<AppState>, u: AuthUser) -> J {
@@ -215,7 +272,7 @@ pub async fn create_site(
     crate::crypto::seal_config(&mut i.provider_config)?;
     let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO sites (account_id, name, domain, from_name, from_email, reply_to, physical_address, provider_kind, \
-         provider_config, send_rate, webhook_secret, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id",
+         provider_config, send_rate, webhook_secret, created_at, public_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id",
     )
     .bind(u.account_id)
     .bind(&i.name)
@@ -229,8 +286,10 @@ pub async fn create_site(
     .bind(i.send_rate)
     .bind(random_token(24))
     .bind(now())
+    .bind(&i.public_url)
     .fetch_one(&st.db)
     .await?;
+    crate::linkdomain::remember(&st.db, id, &i.public_url).await?;
     crate::favicon::refresh_soon(&st, id, i.domain.clone()).await;
     get_site(State(st), u, Path(id)).await
 }
@@ -241,7 +300,7 @@ pub async fn create_site(
 /// the lease cutoff), since those decide what's safe to change or delete from settings they read.
 pub(crate) const UPDATE_SITE_SQL: &str =
     "UPDATE sites SET name=$1, domain=$2, from_name=$3, from_email=$4, reply_to=$5, \
-     physical_address=$6, provider_kind=$7, provider_config=$8, send_rate=$9, \
+     physical_address=$6, provider_kind=$7, provider_config=$8, send_rate=$9, public_url=$12, \
      icon_data = CASE WHEN domain = $2 THEN icon_data ELSE NULL END, \
      icon_type = CASE WHEN domain = $2 THEN icon_type ELSE NULL END, \
      icon_checked_at = CASE WHEN domain = $2 THEN icon_checked_at ELSE NULL END WHERE id=$10 \
@@ -264,6 +323,9 @@ pub async fn update_site(
 ) -> J {
     let existing = site_for(&st, &u, id).await?;
     i.validate()?;
+    // Record the domain being replaced first: if an earlier save stopped before recording it,
+    // it still reaches the history (and /tls/ask) before the setting moves on.
+    crate::linkdomain::remember(&st.db, id, &existing.public_url).await?;
     i.merge_secrets(&existing.provider_config);
     crate::crypto::seal_config(&mut i.provider_config)?;
     let affected = sqlx::query(UPDATE_SITE_SQL)
@@ -278,6 +340,7 @@ pub async fn update_site(
         .bind(i.send_rate)
         .bind(id)
         .bind(crate::setup::lease_cutoff())
+        .bind(&i.public_url)
         .execute(&st.db)
         .await?
         .rows_affected();
@@ -287,6 +350,7 @@ pub async fn update_site(
             "automatic setup is running for this site; save these settings when it finishes",
         ));
     }
+    crate::linkdomain::remember(&st.db, id, &i.public_url).await?;
     // Decide from the row as written (not our earlier read, which a concurrent save may have
     // made stale): an unchecked icon means the domain changed and the icon needs fetching.
     if site_needs_icon(&st.db, id).await? {
@@ -378,14 +442,14 @@ fn yes() -> bool {
     true
 }
 
-fn list_json(l: &List, base_url: &str) -> Value {
+fn list_json(l: &List, site: &Site, base_url: &str) -> Value {
     let mut v = serde_json::to_value(l).unwrap();
-    v["subscribe_url"] = format!("{base_url}/subscribe/{}", l.public_id).into();
+    v["subscribe_url"] = format!("{}/subscribe/{}", site.link_base(base_url), l.public_id).into();
     v
 }
 
 pub async fn list_lists(State(st): State<AppState>, u: AuthUser, Path(site_id): Path<i64>) -> J {
-    site_for(&st, &u, site_id).await?;
+    let site = site_for(&st, &u, site_id).await?;
     let lists: Vec<List> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {LIST_COLS} FROM lists WHERE site_id = $1 ORDER BY name"
     )))
@@ -395,7 +459,7 @@ pub async fn list_lists(State(st): State<AppState>, u: AuthUser, Path(site_id): 
     Ok(Json(Value::Array(
         lists
             .iter()
-            .map(|l| list_json(l, &st.cfg.base_url))
+            .map(|l| list_json(l, &site, &st.cfg.base_url))
             .collect(),
     )))
 }
@@ -442,7 +506,7 @@ pub async fn create_list(
 
 pub async fn get_list(State(st): State<AppState>, u: AuthUser, Path(id): Path<i64>) -> J {
     let (list, site) = list_for(&st, &u, id).await?;
-    let mut v = list_json(&list, &st.cfg.base_url);
+    let mut v = list_json(&list, &site, &st.cfg.base_url);
     v["site"] = site_json(&site, &st.cfg.base_url);
     Ok(Json(v))
 }
@@ -981,6 +1045,40 @@ pub async fn pause_campaign(State(st): State<AppState>, u: AuthUser, Path(id): P
 mod tests {
     use super::*;
 
+    #[test]
+    fn public_url_is_normalized_to_an_origin() {
+        let n = |s: &str| normalize_public_url(s).ok();
+        assert_eq!(n(""), Some(String::new()));
+        assert_eq!(
+            n("Newsletter.Example.com"),
+            Some("https://newsletter.example.com".into())
+        );
+        assert_eq!(
+            n("https://news.example.com/"),
+            Some("https://news.example.com".into())
+        );
+        assert_eq!(
+            n("http://localhost:8080"),
+            Some("http://localhost:8080".into())
+        );
+        assert_eq!(n("http://news.example.com"), None);
+        assert_eq!(n("news.example.com/confirm"), None);
+        assert_eq!(n("https://u:p@news.example.com"), None);
+        assert_eq!(n("news"), None);
+        assert_eq!(
+            n("news.example.com."),
+            Some("https://news.example.com".into())
+        );
+        assert_eq!(n("https://news.example.com:8443"), None);
+        assert_eq!(n("x\"onmouseover=\"alert(1)\".example.com"), None);
+        assert_eq!(n("a_b.example.com"), None);
+        assert_eq!(n("-a.example.com"), None);
+        assert_eq!(
+            n("bücher.example"),
+            Some("https://xn--bcher-kva.example".into())
+        );
+    }
+
     async fn update(db: &crate::db::Db, domain: &str) {
         sqlx::query(UPDATE_SITE_SQL)
             .bind("Site")
@@ -994,6 +1092,7 @@ mod tests {
             .bind(10_i64)
             .bind(1_i64)
             .bind(crate::setup::lease_cutoff())
+            .bind("")
             .execute(db)
             .await
             .unwrap();

@@ -694,6 +694,38 @@ paths:
             application/json:
               schema: { type: object, properties: { ok: { type: boolean }, message_id: { type: string } } }
         '400': { $ref: '#/components/responses/Error' }
+  /api/sites/{id}/link-domain:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Sites]
+      operationId: setupSiteLinkDomain
+      summary: Create and check the link domain's DNS record
+      description: |
+        For a site with a `public_url`, optionally adds the CNAME pointing it at this server through a
+        connected DNS integration (only adds; refuses with 409 if the name already has a different
+        record), then reports whether the hostname resolves and serves this server over HTTPS.
+        Omit `dns_integration_id` to only check.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, properties: { dns_integration_id: { type: [integer, 'null'] } } }
+      responses:
+        '200':
+          description: Current state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  host: { type: string }
+                  record: { type: object, description: 'The CNAME to have: `{ fqdn, type, content }`.' }
+                  dns: { type: [object, 'null'], description: '`{ zone, status: created|exists }` when a DNS integration was used.' }
+                  resolves: { type: boolean }
+                  reachable: { type: boolean, description: The hostname serves this server over HTTPS. }
+                  detail: { type: string, description: What's still missing, if anything. }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
   /api/sites/{id}/icon:
     parameters: [{ $ref: '#/components/parameters/Id' }]
     get:
@@ -1064,6 +1096,17 @@ paths:
             text/html: { schema: { type: string } }
         '400': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/Error' }
+  /tls/ask:
+    get:
+      tags: [Public]
+      operationId: tlsAsk
+      summary: On-demand TLS permission check for reverse proxies
+      description: For Caddy's `on_demand_tls { ask … }`. Returns 200 when `domain` is a site's link domain (or this server's hostname), 404 otherwise.
+      security: []
+      parameters: [{ name: domain, in: query, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Allowed. }
+        '404': { description: Not a known hostname. }
   /confirm/{token}:
     parameters: [{ $ref: '#/components/parameters/Token' }]
     get:
@@ -1235,6 +1278,7 @@ components:
         from_email: { type: string, format: email, example: hello@news.example.com, description: Use a subdomain verified with your provider. }
         reply_to: { type: string, format: email, description: Optional. }
         physical_address: { type: string, example: '123 Main St, Springfield, UT 84000, USA', description: Required before sending (CAN-SPAM). Shown in every footer. }
+        public_url: { type: string, example: newsletter.example.com, description: 'Optional custom domain for confirm, unsubscribe and signup links (must route to this server over HTTPS). Stored as an https:// origin; blank uses the server BASE_URL.' }
         provider_kind: { $ref: '#/components/schemas/ProviderKind' }
         provider_config:
           anyOf:
@@ -1272,6 +1316,8 @@ components:
         from_email: { type: string }
         reply_to: { type: string }
         physical_address: { type: string }
+        public_url: { type: string, description: Custom link origin, or empty. }
+        links_url: { type: string, format: uri, description: Origin actually used for this site's confirm/unsubscribe/signup links. }
         provider_kind: { $ref: '#/components/schemas/ProviderKind' }
         provider_config: { type: object, description: Provider settings with secrets masked. }
         send_rate: { type: integer }

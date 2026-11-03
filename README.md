@@ -73,6 +73,33 @@ For Porkbun, create an API key and turn on **API Access** for each domain Listac
 5. Set the send rate to your SES per-second quota.
 6. Create a newsletter, paste the signup form from the *Signup form* tab into your site.
 
+## Custom link domains
+
+By default confirm and unsubscribe links point at `BASE_URL`. To brand them per site (e.g. `https://newsletter.yourblog.com/confirm/…`), set **Link domain** in the site's settings. The signup form endpoint shown for each newsletter uses it too; the admin UI and SES webhook stay on `BASE_URL`.
+
+The hostname then needs a DNS record and a certificate:
+
+- **DNS:** with Porkbun connected, the **Link domain** card on the site's Settings tab creates the CNAME (`newsletter.yourblog.com → <BASE_URL host>`) and checks that the hostname serves Listaculous over HTTPS. It only adds records and stops if the name already has a different one. Otherwise add the CNAME yourself.
+- **Certificate:** list the hostname in your reverse proxy (Caddy: `news.example.com, newsletter.yourblog.com { … }`), or let Caddy issue certificates on demand for any link domain you configure, with no proxy edits:
+
+  ```caddyfile
+  {
+  	on_demand_tls {
+  		ask http://listaculous:8080/tls/ask
+  	}
+  }
+  https:// {
+  	tls {
+  		on_demand
+  	}
+  	reverse_proxy listaculous:8080
+  }
+  ```
+
+  `/tls/ask` only approves hostnames that some site uses as its link domain.
+
+Links in emails already sent keep their old domain, so leave the old hostname working.
+
 ## API
 
 Everything in the app is available over a JSON API, built so scripts and AI agents can run your newsletters.

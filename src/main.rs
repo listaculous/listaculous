@@ -8,6 +8,7 @@ mod dns;
 mod error;
 mod favicon;
 mod integrations;
+mod linkdomain;
 mod mailer;
 mod models;
 mod openapi;
@@ -179,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(api::delete_site),
         )
         .route("/sites/{id}/test", post(api::test_site))
+        .route("/sites/{id}/link-domain", post(linkdomain::setup))
         .route(
             "/integrations",
             get(integrations::list).post(integrations::create),
@@ -255,6 +257,8 @@ async fn main() -> anyhow::Result<()> {
             post(public::ses_webhook),
         )
         .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz/instance", get(linkdomain::instance))
+        .route("/tls/ask", get(linkdomain::tls_ask))
         .route_service(
             "/docs",
             ServeFile::new(format!("{}/docs.html", cfg.static_dir)),

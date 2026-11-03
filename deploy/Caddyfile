@@ -1,5 +1,7 @@
 # Caddy reverse proxy with automatic HTTPS. Replace the hostname, point DNS at this server,
 # and run Listaculous with ports "127.0.0.1:8080:8080" and TRUST_PROXY=true.
+# To give a site its own link domain (Site settings -> Link domain), list it here too, e.g.
+#   news.example.com, newsletter.yourblog.com {
 news.example.com {
 	reverse_proxy 127.0.0.1:8080
 	header {
