@@ -74,6 +74,12 @@ pub async fn run(st: AppState) {
                 tracing::error!("worker recovery failed: {e:#}");
             }
         }
+        // Every 15s: enroll new course subscribers and queue lessons that have come due.
+        if ticks % 75 == 1 {
+            if let Err(e) = crate::drip::advance(&st.db, &now()).await {
+                tracing::error!("email course scheduler failed: {e:#}");
+            }
+        }
         if let Err(e) = tick(&st, &mut buckets).await {
             tracing::error!("worker error: {e:#}");
         }
@@ -111,7 +117,8 @@ struct QueuedSend {
 
 async fn tick(st: &AppState, buckets: &mut RateBuckets) -> anyhow::Result<()> {
     let rows: Vec<(i64, i64)> = sqlx::query_as(
-        "SELECT c.id, l.site_id FROM campaigns c JOIN lists l ON l.id = c.list_id WHERE c.status = 'sending' ORDER BY c.id",
+        "SELECT c.id, l.site_id FROM campaigns c JOIN lists l ON l.id = c.list_id WHERE c.status = 'sending' \
+         AND (c.sequence_id IS NULL OR c.sequence_id IN (SELECT id FROM sequences WHERE status = 'active')) ORDER BY c.id",
     )
     .fetch_all(&st.db)
     .await?;
@@ -151,7 +158,8 @@ async fn claim_chunk<'a>(
         let r = sqlx::query(
             "UPDATE campaign_sends SET status = 'sending', attempts = attempts + 1, next_attempt_at = $1 \
              WHERE id = $2 AND status = 'queued' \
-             AND EXISTS (SELECT 1 FROM campaigns WHERE id = $3 AND status = 'sending') \
+             AND EXISTS (SELECT 1 FROM campaigns WHERE id = $3 AND status = 'sending' AND TRIM(subject) <> '' AND TRIM(html_body) <> '' \
+               AND (sequence_id IS NULL OR sequence_id IN (SELECT id FROM sequences WHERE status = 'active'))) \
              AND EXISTS (SELECT 1 FROM subscriptions s JOIN subscribers sb ON sb.id = s.subscriber_id \
                WHERE s.id = campaign_sends.subscription_id AND s.token = $4 AND s.status = 'confirmed' AND sb.status = 'active')",
         )
@@ -200,6 +208,19 @@ async fn process_campaign(
     .bind(c.list_id)
     .fetch_one(&st.db)
     .await?;
+    // Course lessons are live all the time but usually have nothing queued; only check the site's
+    // setup (which pauses the lesson on failure) when there's something to send.
+    if c.sequence_id.is_some() {
+        let (pending,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM campaign_sends WHERE campaign_id = $1 AND status = 'queued'",
+        )
+        .bind(c.id)
+        .fetch_one(&st.db)
+        .await?;
+        if pending == 0 {
+            return Ok(());
+        }
+    }
     if site.physical_address.trim().is_empty() {
         anyhow::bail!("site has no physical mailing address (required in every footer)");
     }
@@ -237,7 +258,8 @@ async fn process_campaign(
         .bind(c.id)
         .fetch_one(&st.db)
         .await?;
-        if remaining == 0 {
+        // Course lessons never finish: new subscribers keep reaching them.
+        if remaining == 0 && c.sequence_id.is_none() {
             sqlx::query("UPDATE campaigns SET status = 'sent', finished_at = $1 WHERE id = $2 AND status = 'sending'")
                 .bind(now())
                 .bind(c.id)

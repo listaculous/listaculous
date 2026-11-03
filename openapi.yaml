@@ -80,6 +80,12 @@ tags:
     description: People subscribed to a list.
   - name: Campaigns
     description: Emails sent to a list.
+  - name: Email courses
+    description: |
+      Drip sequences: lessons sent automatically on day N after each subscriber confirms. Each lesson
+      is a campaign (`sequence_id` set) edited with the campaign endpoints. Subscribers who confirm
+      after the course is first started are enrolled (CSV imports are not); lessons go out in
+      `delay_days` order at the time of day the person signed up.
   - name: Integrations
     description: |
       Connected cloud accounts used for automatic setup: an **AWS setup key** (see
@@ -917,6 +923,78 @@ paths:
           content:
             text/csv:
               schema: { type: string }
+  /api/lists/{id}/sequences:
+    parameters: [{ $ref: '#/components/parameters/ListId' }]
+    get:
+      tags: [Email courses]
+      operationId: listSequences
+      summary: List a newsletter's email courses
+      responses:
+        '200':
+          description: Courses with their lessons and enrollment counts.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Sequence' } } } }
+    post:
+      tags: [Email courses]
+      operationId: createSequence
+      summary: Create an email course (as a draft)
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string, example: 7-day budgeting course } } }
+      responses:
+        '200': { description: The course., content: { application/json: { schema: { $ref: '#/components/schemas/Sequence' } } } }
+  /api/sequences/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Email courses]
+      operationId: getSequence
+      summary: Get an email course
+      responses:
+        '200': { description: The course., content: { application/json: { schema: { $ref: '#/components/schemas/Sequence' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Email courses]
+      operationId: updateSequence
+      summary: Rename, start or pause an email course
+      description: |
+        `status: active` starts (or resumes) the course; it needs the site's mailing address, a working
+        provider and at least one written lesson. `paused` stops new lessons going out; subscribers who
+        sign up meanwhile are enrolled when it resumes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                status: { type: string, enum: [active, paused] }
+      responses:
+        '200': { description: The course., content: { application/json: { schema: { $ref: '#/components/schemas/Sequence' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Email courses]
+      operationId: deleteSequence
+      summary: Delete an email course and its lessons
+      responses:
+        '200': { description: Deleted., content: { application/json: { schema: { type: object, properties: { ok: { type: boolean } } } } } }
+  /api/sequences/{id}/lessons:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Email courses]
+      operationId: addSequenceLesson
+      summary: Add a lesson
+      description: Creates the lesson's campaign. Without `delay_days` it goes one day after the current last lesson (day 0 for the first). Edit it with `PUT /api/campaigns/{id}`.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                subject: { type: string }
+                delay_days: { type: integer, minimum: 0, maximum: 3650 }
+      responses:
+        '200': { $ref: '#/components/responses/Campaign' }
   /api/subscriptions/{id}:
     parameters: [{ $ref: '#/components/parameters/Id' }]
     delete:
@@ -984,7 +1062,7 @@ paths:
     put:
       tags: [Campaigns]
       operationId: updateCampaign
-      summary: Edit a draft
+      summary: Edit a draft or an email-course lesson
       requestBody:
         required: true
         content:
@@ -1374,6 +1452,7 @@ components:
             `{{unsubscribe_url}}`. Values are HTML-escaped. Wrapped in a responsive layout with the
             compliance footer.
         text_body: { type: string, description: Plain-text alternative. Generated from the HTML when blank. }
+        delay_days: { type: integer, minimum: 0, description: 'Email-course lessons only: days after the subscriber confirmed (0 = right away).' }
     Campaign:
       type: object
       properties:
@@ -1387,6 +1466,24 @@ components:
         created_at: { type: string, format: date-time }
         started_at: { type: [string, 'null'], format: date-time }
         finished_at: { type: [string, 'null'], format: date-time }
+        sequence_id: { type: [integer, 'null'], description: The email course this lesson belongs to; null for a regular campaign. }
+        delay_days: { type: integer, description: 'Lessons: days after the subscriber confirmed.' }
+    Sequence:
+      type: object
+      properties:
+        id: { type: integer }
+        list_id: { type: integer }
+        name: { type: string }
+        status: { type: string, enum: [draft, active, paused] }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time, description: First start; only subscribers confirmed from then on are enrolled. }
+        lessons: { type: array, items: { $ref: '#/components/schemas/CampaignWithStats' }, description: 'Ordered by delay_days. Lesson status is `sending` (live) or `paused` (stopped after repeated send failures; resume it with POST /api/campaigns/{id}/send).' }
+        stats:
+          type: object
+          properties:
+            enrolled: { type: integer }
+            completed: { type: integer }
+            in_progress: { type: integer }
     CampaignWithStats:
       allOf:
         - $ref: '#/components/schemas/Campaign'

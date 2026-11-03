@@ -19,6 +19,7 @@
   import Alert from '../components/Alert.svelte';
   import Empty from '../components/Empty.svelte';
   import CodeBlock from '../components/CodeBlock.svelte';
+  import Course from '../components/Course.svelte';
   let { id, tab = 'subscribers' } = $props();
 
   let list = $state(null);
@@ -156,6 +157,7 @@ const { message, error } = await res.json();` : '');
   <div class="tabs" role="tablist">
     <button class:active={tab === 'subscribers'} onclick={() => setTab('subscribers')}>Subscribers</button>
     <button class:active={tab === 'campaigns'} onclick={() => setTab('campaigns')}>Campaigns</button>
+    <button class:active={tab === 'course'} onclick={() => setTab('course')}>Email course</button>
     <button class:active={tab === 'form'} onclick={() => setTab('form')}>Signup form</button>
     <button class:active={tab === 'settings'} onclick={() => setTab('settings')}>Settings</button>
   </div>
@@ -263,6 +265,8 @@ const { message, error } = await res.json();` : '');
         </div>
       {/if}
     </div>
+  {:else if tab === 'course'}
+    <Course {list} />
   {:else if tab === 'form'}
     <div class="card">
       <div class="card-head">

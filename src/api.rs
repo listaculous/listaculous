@@ -28,7 +28,7 @@ pub(crate) async fn site_for(st: &AppState, u: &AuthUser, id: i64) -> AppResult<
     .ok_or_else(AppError::not_found)
 }
 
-async fn list_for(st: &AppState, u: &AuthUser, id: i64) -> AppResult<(List, Site)> {
+pub(crate) async fn list_for(st: &AppState, u: &AuthUser, id: i64) -> AppResult<(List, Site)> {
     let list: List = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {LIST_COLS} FROM lists WHERE id = $1"
     )))
@@ -801,9 +801,12 @@ pub struct CampaignInput {
     pub html_body: String,
     #[serde(default)]
     pub text_body: String,
+    /// Email-course lessons only: days after the subscriber confirmed.
+    #[serde(default)]
+    pub delay_days: Option<i64>,
 }
 
-async fn campaign_json(st: &AppState, c: &Campaign) -> AppResult<Value> {
+pub(crate) async fn campaign_json(st: &AppState, c: &Campaign) -> AppResult<Value> {
     let (total, sent, failed, skipped): (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), COUNT(CASE WHEN status = 'sent' THEN 1 END), COUNT(CASE WHEN status = 'failed' THEN 1 END), \
          COUNT(CASE WHEN status = 'skipped' THEN 1 END) FROM campaign_sends WHERE campaign_id = $1",
@@ -823,7 +826,7 @@ pub async fn list_campaigns(
 ) -> J {
     list_for(&st, &u, list_id).await?;
     let cs: Vec<Campaign> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {CAMPAIGN_COLS} FROM campaigns WHERE list_id = $1 ORDER BY id DESC"
+        "SELECT {CAMPAIGN_COLS} FROM campaigns WHERE list_id = $1 AND sequence_id IS NULL ORDER BY id DESC"
     )))
     .bind(list_id)
     .fetch_all(&st.db)
@@ -869,6 +872,50 @@ pub async fn update_campaign(
     Json(i): Json<CampaignInput>,
 ) -> J {
     let (c, _, _) = campaign_for(&st, &u, id).await?;
+    if c.sequence_id.is_some() {
+        // Course lessons stay editable: the worker renders each message from the current row.
+        let delay = i
+            .delay_days
+            .unwrap_or(c.delay_days)
+            .clamp(0, crate::drip::MAX_DELAY_DAYS);
+        // Whitespace-only counts as unwritten everywhere (the scheduler and the sender's claim).
+        let blank = |v: &str| {
+            if v.trim().is_empty() {
+                String::new()
+            } else {
+                v.to_string()
+            }
+        };
+        let seq_id = c.sequence_id.unwrap_or_default();
+        let mut tx = st.db.begin().await?;
+        crate::drip::bump_revision(&mut tx, seq_id).await?;
+        // Re-read the day inside the transaction: the edit and the queue clean-up must agree.
+        let (old_delay,): (i64,) = sqlx::query_as("SELECT delay_days FROM campaigns WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE campaigns SET subject=$1, preheader=$2, html_body=$3, text_body=$4, delay_days=$5 WHERE id=$6")
+            .bind(i.subject.trim())
+            .bind(&i.preheader)
+            .bind(blank(&i.html_body))
+            .bind(&i.text_body)
+            .bind(delay)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if delay != old_delay {
+            crate::drip::reopen(&mut tx, seq_id).await?;
+            // Not-yet-claimed sends were queued for the old day; the scheduler re-queues each
+            // subscriber when the new day comes. Same transaction, so the sender can't claim one
+            // in between.
+            sqlx::query("DELETE FROM campaign_sends WHERE campaign_id = $1 AND status = 'queued'")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        return get_campaign(State(st), u, Path(id)).await;
+    }
     if c.status != "draft" {
         return Err(AppError::bad_request("only draft campaigns can be edited"));
     }
@@ -891,6 +938,17 @@ pub async fn update_campaign(
 
 pub async fn delete_campaign(State(st): State<AppState>, u: AuthUser, Path(id): Path<i64>) -> J {
     let (c, _, _) = campaign_for(&st, &u, id).await?;
+    if c.sequence_id.is_some() {
+        // A lesson can go any time; its queued sends are deleted with it.
+        let mut tx = st.db.begin().await?;
+        crate::drip::bump_revision(&mut tx, c.sequence_id.unwrap_or_default()).await?;
+        sqlx::query("DELETE FROM campaigns WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(Json(json!({ "ok": true })));
+    }
     if c.status == "sending" {
         return Err(AppError::bad_request(
             "pause the campaign before deleting it",
@@ -965,6 +1023,25 @@ pub async fn test_campaign(
 
 pub async fn send_campaign(State(st): State<AppState>, u: AuthUser, Path(id): Path<i64>) -> J {
     let (c, list, site) = campaign_for(&st, &u, id).await?;
+    if c.sequence_id.is_some() && c.status != "paused" {
+        return Err(AppError::bad_request(
+            "course lessons are sent automatically; start the course instead",
+        ));
+    }
+    if c.sequence_id.is_some() {
+        // Resuming a lesson only lets its queue drain again. Unlike a broadcast, its definitive
+        // failures stay failed: those subscribers have already moved on to later lessons.
+        mailer::provider_for(&site, &st.http)
+            .map_err(|e| AppError::bad_request(format!("{e:#}")))?;
+        let mut tx = st.db.begin().await?;
+        crate::drip::bump_revision(&mut tx, c.sequence_id.unwrap_or_default()).await?;
+        sqlx::query("UPDATE campaigns SET status = 'sending' WHERE id = $1 AND status = 'paused'")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return get_campaign(State(st), u, Path(id)).await;
+    }
     if c.subject.trim().is_empty() || c.html_body.trim().is_empty() {
         return Err(AppError::bad_request("subject and body are required"));
     }
