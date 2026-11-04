@@ -15,7 +15,8 @@ Lightweight, self-hosted newsletter manager. Rust + Svelte + SQLite (or Postgres
   - Automatic **bounce & complaint suppression** via SES → SNS webhook
   - Honeypot + per-IP rate limiting on signup; identical responses so list membership can't be probed
   - Suppressed addresses can't be re-added by forms or imports
-- **Email courses** (drip sequences): lessons sent automatically on day N after each subscriber confirms
+- **Automations** built as a visual flowchart: welcome series, email courses, follow-ups. Triggers (joins, gets a tag, clicks a link, added by hand), emails, waits, if/else on opens/clicks/tags, tag and newsletter steps, goals
+- **Tags** on subscribers, and **open/click tracking** on every email
 - Campaign editor with live preview, test sends, rate-limited background sending that resumes after restarts, pause/resume
 - CSV import/export, subscriber search
 
@@ -74,15 +75,20 @@ For Porkbun, create an API key and turn on **API Access** for each domain Listac
 5. Set the send rate to your SES per-second quota.
 6. Create a newsletter, paste the signup form from the *Signup form* tab into your site.
 
-## Email courses
+## Automations
 
-A newsletter's **Email course** tab sends each new subscriber a series of lessons, e.g. a 7-day course: **Create a 7-day course** makes lessons for day 0–6, you write them in the normal editor, then **Start course**.
+A newsletter's **Automations** tab maps out what happens to people as a flowchart (start from scratch, a welcome series or a 7-day email course). Click **+** between steps to add one; click a step to edit it in the side panel.
 
-- Everyone who confirms *after* the course starts is enrolled. Subscribers you already had and CSV imports are not, so starting a course never blasts your existing list.
-- Lessons go out on day N after the person confirmed, at the time of day they signed up (day 0 right away). They use the same sender as campaigns: rate limits, retries, unsubscribe footer, link domain.
-- Lessons stay editable while the course runs; the next send uses what's saved. A lesson added later only reaches people who haven't passed its day. Unwritten lessons hold subscribers at that point until written.
-- Unsubscribing stops the lessons; resubscribing resumes where they left off. **Pause** stops all lessons; people who sign up meanwhile are enrolled when you resume.
-- If a lesson keeps failing to send, it pauses itself (shown on the course) and subscribers wait there until you resume it.
+- **Triggers:** joins the newsletter (CSV imports only if you tick the box), gets a tag, clicks a link in a campaign, or added by hand (**Add existing subscribers**, all or by tag). Only events after you first **Start** the automation count, so starting one never blasts your existing list. Each person goes through an automation once.
+- **Steps:** send an email (written in the normal editor), wait (minutes to weeks, or *until* they open/click/get a tag, with a time limit), if/else (opened or clicked an email, has a tag, is on a newsletter), add/remove a tag, subscribe to/unsubscribe from another newsletter on the site, goal (anyone earlier in the flow who meets it jumps straight to it, e.g. stop the sales emails once they buy) and exit.
+- Emails use the same sender as campaigns: rate limits, retries, unsubscribe footer, link domain. If an email keeps failing it pauses itself (shown on the flowchart) and people wait there until you resume it; an unwritten email holds people too.
+- Editing a running automation is safe: changes save as you make them, and people at a removed step carry on from what came after it. Each step shows how many people are there now.
+- Unsubscribed or bounced people wait where they are and carry on if they resubscribe. **Pause** stops everything; people triggered meanwhile are enrolled on resume.
+- Email courses from earlier versions are converted to automations automatically on upgrade.
+
+**Tags** are on the person (shared by a site's newsletters). Add them on the Subscribers tab, when importing a CSV (handy for starting an automation for an imported group), via the API, or with a Tag step.
+
+**Tracking:** links in campaign and automation emails go through `/c/…` on the link domain to record clicks, and a 1×1 image records opens. Opens are approximate (Apple Mail and others load images automatically; some apps block them), so prefer click conditions where it matters. Links containing `{{placeholders}}` aren't tracked.
 
 ## Custom link domains
 

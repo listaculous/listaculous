@@ -74,10 +74,10 @@ pub async fn run(st: AppState) {
                 tracing::error!("worker recovery failed: {e:#}");
             }
         }
-        // Every 15s: enroll new course subscribers and queue lessons that have come due.
+        // Every 15s: enroll newly triggered subscribers in automations and move everyone on.
         if ticks % 75 == 1 {
-            if let Err(e) = crate::drip::advance(&st.db, &now()).await {
-                tracing::error!("email course scheduler failed: {e:#}");
+            if let Err(e) = crate::automation::advance(&st.db, &now()).await {
+                tracing::error!("automation scheduler failed: {e:#}");
             }
         }
         if let Err(e) = tick(&st, &mut buckets).await {
@@ -118,7 +118,7 @@ struct QueuedSend {
 async fn tick(st: &AppState, buckets: &mut RateBuckets) -> anyhow::Result<()> {
     let rows: Vec<(i64, i64)> = sqlx::query_as(
         "SELECT c.id, l.site_id FROM campaigns c JOIN lists l ON l.id = c.list_id WHERE c.status = 'sending' \
-         AND (c.sequence_id IS NULL OR c.sequence_id IN (SELECT id FROM sequences WHERE status = 'active')) ORDER BY c.id",
+         AND (c.automation_id IS NULL OR c.automation_id IN (SELECT id FROM automations WHERE status = 'active')) ORDER BY c.id",
     )
     .fetch_all(&st.db)
     .await?;
@@ -159,7 +159,7 @@ async fn claim_chunk<'a>(
             "UPDATE campaign_sends SET status = 'sending', attempts = attempts + 1, next_attempt_at = $1 \
              WHERE id = $2 AND status = 'queued' \
              AND EXISTS (SELECT 1 FROM campaigns WHERE id = $3 AND status = 'sending' AND TRIM(subject) <> '' AND TRIM(html_body) <> '' \
-               AND (sequence_id IS NULL OR sequence_id IN (SELECT id FROM sequences WHERE status = 'active'))) \
+               AND (automation_id IS NULL OR automation_id IN (SELECT id FROM automations WHERE status = 'active'))) \
              AND EXISTS (SELECT 1 FROM subscriptions s JOIN subscribers sb ON sb.id = s.subscriber_id \
                WHERE s.id = campaign_sends.subscription_id AND s.token = $4 AND s.status = 'confirmed' AND sb.status = 'active')",
         )
@@ -208,9 +208,9 @@ async fn process_campaign(
     .bind(c.list_id)
     .fetch_one(&st.db)
     .await?;
-    // Course lessons are live all the time but usually have nothing queued; only check the site's
-    // setup (which pauses the lesson on failure) when there's something to send.
-    if c.sequence_id.is_some() {
+    // Automation emails are live all the time but usually have nothing queued; only check the
+    // site's setup (which pauses the email on failure) when there's something to send.
+    if c.automation_id.is_some() {
         let (pending,): (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM campaign_sends WHERE campaign_id = $1 AND status = 'queued'",
         )
@@ -258,8 +258,8 @@ async fn process_campaign(
         .bind(c.id)
         .fetch_one(&st.db)
         .await?;
-        // Course lessons never finish: new subscribers keep reaching them.
-        if remaining == 0 && c.sequence_id.is_none() {
+        // Automation emails never finish: new subscribers keep reaching them.
+        if remaining == 0 && c.automation_id.is_none() {
             sqlx::query("UPDATE campaigns SET status = 'sent', finished_at = $1 WHERE id = $2 AND status = 'sending'")
                 .bind(now())
                 .bind(c.id)
@@ -269,6 +269,9 @@ async fn process_campaign(
         }
         return Ok(());
     }
+
+    let links = crate::tracking::links_for(&st.db, c.id, &c.html_body).await?;
+    let link_base = site.link_base(&st.cfg.base_url);
 
     // Work in small chunks: each chunk is claimed immediately before its provider calls (so a pause,
     // unsubscribe or token rotation stops everything not yet claimed) and only MAX_IN_FLIGHT rendered
@@ -296,15 +299,16 @@ async fn process_campaign(
         }
 
         outcomes.extend(join_all(batch.iter().map(|&q| {
-        let (provider, list, c) = (&provider, &list, &c);
+        let (provider, list, c, links) = (&provider, &list, &c, &links);
         async move {
-            let email = render_campaign(
+            let mut email = render_campaign(
                 &st.cfg.base_url,
                 site,
                 list,
                 c,
                 &Recipient { email: &q.email, name: &q.name, token: &q.token },
             );
+            crate::tracking::apply(&mut email, link_base, c.id, &q.token, links);
             let res = match mailer::build_message(site, &email) {
                 Ok(msg) => provider.send(&msg).await,
                 Err(e) => Err(SendError::new(FailureKind::Permanent, format!("{e:#}"))),
