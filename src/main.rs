@@ -1,11 +1,11 @@
 mod api;
 mod api_keys;
 mod auth;
+mod automation;
 mod aws;
 mod crypto;
 mod db;
 mod dns;
-mod drip;
 mod error;
 mod favicon;
 mod integrations;
@@ -16,6 +16,7 @@ mod openapi;
 mod passkeys;
 mod public;
 mod setup;
+mod tracking;
 mod worker;
 
 use std::collections::HashMap;
@@ -128,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
     crypto::init(&cfg.database_url)?;
     let db = db::connect(&cfg.database_url).await?;
     crypto::migrate_plaintext(&db).await?;
+    automation::convert_courses(&db).await?;
     let instance_id = db::instance_id(&db).await?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -223,12 +225,28 @@ async fn main() -> anyhow::Result<()> {
             "/lists/{id}/campaigns",
             get(api::list_campaigns).post(api::create_campaign),
         )
-        .route("/lists/{id}/sequences", get(drip::list).post(drip::create))
         .route(
-            "/sequences/{id}",
-            get(drip::get).put(drip::update).delete(drip::delete),
+            "/lists/{id}/automations",
+            get(automation::list).post(automation::create),
         )
-        .route("/sequences/{id}/lessons", post(drip::add_lesson))
+        .route(
+            "/automations/{id}",
+            get(automation::get)
+                .put(automation::update)
+                .delete(automation::delete),
+        )
+        .route("/automations/{id}/emails", post(automation::create_email))
+        .route("/automations/{id}/enroll", post(automation::enroll_now))
+        .route(
+            "/sites/{id}/tags",
+            get(api::list_tags).post(api::create_tag),
+        )
+        .route("/tags/{id}", delete(api::delete_tag))
+        .route("/subscriptions/{id}/tags", post(api::tag_subscription))
+        .route(
+            "/subscriptions/{id}/tags/{tag_id}",
+            delete(api::untag_subscription),
+        )
         .route("/subscriptions/{id}", delete(api::delete_subscription))
         .route(
             "/subscriptions/{id}/unsubscribe",
@@ -263,6 +281,8 @@ async fn main() -> anyhow::Result<()> {
             "/webhooks/ses/{site_id}/{secret}",
             post(public::ses_webhook),
         )
+        .route("/c/{key}/{token}", get(tracking::click))
+        .route("/o/{campaign_id}/{token}", get(tracking::open))
         .route("/healthz", get(|| async { "ok" }))
         .route("/healthz/instance", get(linkdomain::instance))
         .route("/tls/ask", get(linkdomain::tls_ask))

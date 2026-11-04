@@ -19,8 +19,11 @@
   import Alert from '../components/Alert.svelte';
   import Empty from '../components/Empty.svelte';
   import CodeBlock from '../components/CodeBlock.svelte';
-  import Course from '../components/Course.svelte';
-  let { id, tab = 'subscribers' } = $props();
+  import Automations from '../components/Automations.svelte';
+  import X from '@lucide/svelte/icons/x';
+  let { id, tab: tabParam = 'subscribers' } = $props();
+  // `course` was the old name of the automations tab.
+  let tab = $derived(tabParam === 'course' ? 'automations' : tabParam);
 
   let list = $state(null);
   let subs = $state({ items: [], total: 0, page: 0, page_size: 50 });
@@ -31,6 +34,11 @@
   let addEmail = $state('');
   let addName = $state('');
   let csv = $state('');
+  let importTag = $state('');
+  let tags = $state([]);
+  let tagFilter = $state(0);
+  let tagging = $state(null);
+  let tagInput = $state('');
   let msg = $state('');
   let error = $state('');
   let edit = $state(null);
@@ -39,17 +47,41 @@
   async function load() {
     list = await api(`/lists/${id}`);
     edit = { name: list.name, description: list.description, double_opt_in: !!list.double_opt_in, redirect_url: list.redirect_url };
-    if (tab === 'subscribers') await loadSubs();
+    if (tab === 'subscribers') { await loadSubs(); loadTags(); }
     if (tab === 'campaigns') campaigns = await api(`/lists/${id}/campaigns`);
   }
   let subsReq = 0;
   async function loadSubs() {
     // Only the latest request may update the table (typing fires many requests).
     const n = ++subsReq;
-    const r = await api(`/lists/${id}/subscribers?q=${encodeURIComponent(q)}&status=${status}&page=${page}`);
+    const r = await api(`/lists/${id}/subscribers?q=${encodeURIComponent(q)}&status=${status}&page=${page}&tag_id=${tagFilter}`);
     if (n === subsReq) subs = r;
   }
   load();
+
+  async function loadTags() {
+    try { tags = await api(`/sites/${list.site_id}/tags`); } catch {}
+  }
+
+  async function addTag(s) {
+    if (tagging !== s.id) return;
+    const name = tagInput;
+    // Close this subscriber's editor now, so finishing later can't touch another one's.
+    tagging = null;
+    tagInput = '';
+    if (!name.trim()) return;
+    try {
+      s.tags = await api(`/subscriptions/${s.id}/tags`, { method: 'POST', body: { name } });
+      loadTags();
+    } catch (err) { fail(err); }
+  }
+
+  async function removeTag(s, t) {
+    try {
+      s.tags = await api(`/subscriptions/${s.id}/tags/${t.id}`, { method: 'DELETE' });
+      loadTags();
+    } catch (err) { fail(err); }
+  }
 
   let counts = $derived(nav.lists.find((l) => l.id === id) ?? { confirmed: 0, pending: 0, unsubscribed: 0 });
 
@@ -70,9 +102,11 @@
 
   async function importCsv() {
     try {
-      const r = await api(`/lists/${id}/import`, { method: 'POST', body: { csv } });
-      flash(`Imported ${r.added}. Skipped ${r.skipped} (already subscribed, unsubscribed or suppressed) and ${r.invalid} invalid.`);
+      const r = await api(`/lists/${id}/import`, { method: 'POST', body: { csv, tag: importTag } });
+      flash(`Imported ${r.added}. Skipped ${r.skipped} (already subscribed, unsubscribed or suppressed) and ${r.invalid} invalid.${importTag.trim() ? ` Subscribed people in the file are tagged “${importTag.trim().toLowerCase()}”.` : ''}`);
       csv = '';
+      importTag = '';
+      loadTags();
       loadSubs();
       refreshNav();
     } catch (err) { fail(err); }
@@ -157,7 +191,7 @@ const { message, error } = await res.json();` : '');
   <div class="tabs" role="tablist">
     <button class:active={tab === 'subscribers'} onclick={() => setTab('subscribers')}>Subscribers</button>
     <button class:active={tab === 'campaigns'} onclick={() => setTab('campaigns')}>Campaigns</button>
-    <button class:active={tab === 'course'} onclick={() => setTab('course')}>Email course</button>
+    <button class:active={tab === 'automations'} onclick={() => setTab('automations')}>Automations</button>
     <button class:active={tab === 'form'} onclick={() => setTab('form')}>Signup form</button>
     <button class:active={tab === 'settings'} onclick={() => setTab('settings')}>Settings</button>
   </div>
@@ -175,18 +209,24 @@ const { message, error } = await res.json();` : '');
           <option value="pending">Pending</option>
           <option value="unsubscribed">Unsubscribed</option>
         </select>
+        {#if tags.length}
+          <select bind:value={tagFilter} onchange={() => { page = 0; loadSubs(); }}>
+            <option value={0}>All tags</option>
+            {#each tags as t (t.id)}<option value={t.id}>{t.name} ({t.subscribers})</option>{/each}
+          </select>
+        {/if}
         <span class="spacer"></span>
         <span class="small muted">{subs.total.toLocaleString()} subscriber{subs.total === 1 ? '' : 's'}</span>
         <a class="btn secondary" href="/api/lists/{id}/export"><Download size={15} /> Export CSV</a>
       </div>
       {#if subs.items.length === 0}
-        <Empty title={q || status ? 'No matches' : 'No subscribers yet'} icon={Users}>
-          {q || status ? 'Try a different search or filter.' : 'Share your signup form, add someone below, or import a CSV.'}
+        <Empty title={q || status || tagFilter ? 'No matches' : 'No subscribers yet'} icon={Users}>
+          {q || status || tagFilter ? 'Try a different search or filter.' : 'Share your signup form, add someone below, or import a CSV.'}
         </Empty>
       {:else}
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Subscriber</th><th>Status</th><th>Source</th><th>Joined</th><th></th></tr></thead>
+            <thead><tr><th>Subscriber</th><th>Status</th><th>Tags</th><th>Source</th><th>Joined</th><th></th></tr></thead>
             <tbody>
               {#each subs.items as s (s.id)}
                 <tr>
@@ -194,6 +234,19 @@ const { message, error } = await res.json();` : '');
                   <td>
                     <span class="badge {s.status}">{s.status}</span>
                     {#if s.subscriber_status !== 'active'}<span class="badge {s.subscriber_status}">{s.subscriber_status}</span>{/if}
+                  </td>
+                  <td>
+                    <span class="tag-list">
+                      {#each s.tags as t (t.id)}<span class="tag-chip">{t.name}<button class="ghost" aria-label="Remove tag {t.name}" onclick={() => removeTag(s, t)}><X size={11} /></button></span>{/each}
+                      {#if tagging === s.id}
+                        <form onsubmit={(e) => { e.preventDefault(); addTag(s); }} style="display:inline">
+                          <!-- svelte-ignore a11y_autofocus -->
+                          <input class="tag-input" list="site-tags" bind:value={tagInput} autofocus onblur={() => addTag(s)} placeholder="tag" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" />
+                        </form>
+                      {:else}
+                        <button class="link small" onclick={() => { tagging = s.id; tagInput = ''; }}>+ tag</button>
+                      {/if}
+                    </span>
                   </td>
                   <td class="small muted">{s.source}</td>
                   <td class="small muted">{fmtDate(s.created_at)}</td>
@@ -232,6 +285,8 @@ const { message, error } = await res.json();` : '');
         <div class="card-head"><div><h2>Import CSV</h2><p class="muted small">Columns <code>email,name</code>, or a file exported from Listaculous. Only import people who opted in.</p></div></div>
         <label class="field">CSV file <input type="file" accept=".csv,text/csv,text/plain" onchange={onFile} /></label>
         <label class="field">…or paste <textarea rows="4" bind:value={csv} placeholder="jane@example.com,Jane"></textarea></label>
+        <label class="field">Tag them <span class="muted">(optional)</span> <input list="site-tags" bind:value={importTag} placeholder="e.g. imported-2026" autocomplete="off" data-bwignore data-1p-ignore data-lpignore="true" />
+          <span class="hint">Use it to start an automation for these people (trigger: gets a tag).</span></label>
         <button onclick={importCsv} disabled={!csv.trim()}><Upload size={16} /> Import</button>
       </div>
     </div>
@@ -265,8 +320,8 @@ const { message, error } = await res.json();` : '');
         </div>
       {/if}
     </div>
-  {:else if tab === 'course'}
-    <Course {list} />
+  {:else if tab === 'automations'}
+    <Automations {list} />
   {:else if tab === 'form'}
     <div class="card">
       <div class="card-head">
@@ -307,3 +362,5 @@ const { message, error } = await res.json();` : '');
     </div>
   {/if}
 {/if}
+
+<datalist id="site-tags">{#each tags as t (t.id)}<option value={t.name}></option>{/each}</datalist>

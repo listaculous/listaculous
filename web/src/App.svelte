@@ -20,6 +20,7 @@
   import NewSite from './pages/NewSite.svelte';
   import List from './pages/List.svelte';
   import Campaign from './pages/Campaign.svelte';
+  import Automation from './pages/Automation.svelte';
   import Account from './pages/Account.svelte';
   import Integrations from './pages/Integrations.svelte';
 
@@ -121,6 +122,8 @@
               <List {id} tab={route.parts[2] || 'subscribers'} />
             {:else if page === 'campaigns' && id}
               <Campaign {id} />
+            {:else if page === 'automations' && id}
+              <Automation {id} />
             {:else if page === 'integrations'}
               <Integrations />
             {:else if page === 'account'}

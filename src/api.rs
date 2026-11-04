@@ -552,6 +552,9 @@ pub struct SubQuery {
     pub status: String,
     #[serde(default)]
     pub page: i64,
+    /// Only subscribers with this tag.
+    #[serde(default)]
+    pub tag_id: i64,
 }
 
 pub async fn list_subscribers(
@@ -567,28 +570,49 @@ pub async fn list_subscribers(
         "SELECT s.id, sb.email, sb.name, s.status, sb.status, s.consent_source, s.created_at, s.confirmed_at, s.unsubscribed_at \
          FROM subscriptions s JOIN subscribers sb ON sb.id = s.subscriber_id \
          WHERE s.list_id = $1 AND (sb.email LIKE $2 OR LOWER(sb.name) LIKE $2) AND ($3 = '' OR s.status = $3) \
+         AND ($5 = 0 OR EXISTS (SELECT 1 FROM subscriber_tags st WHERE st.subscriber_id = s.subscriber_id AND st.tag_id = $5)) \
          ORDER BY s.id DESC LIMIT 50 OFFSET $4",
     )
     .bind(id)
     .bind(&pattern)
     .bind(&q.status)
     .bind(page * 50)
+    .bind(q.tag_id)
     .fetch_all(&st.db)
     .await?;
     let (total,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM subscriptions s JOIN subscribers sb ON sb.id = s.subscriber_id \
-         WHERE s.list_id = $1 AND (sb.email LIKE $2 OR LOWER(sb.name) LIKE $2) AND ($3 = '' OR s.status = $3)",
+         WHERE s.list_id = $1 AND (sb.email LIKE $2 OR LOWER(sb.name) LIKE $2) AND ($3 = '' OR s.status = $3) \
+         AND ($4 = 0 OR EXISTS (SELECT 1 FROM subscriber_tags st WHERE st.subscriber_id = s.subscriber_id AND st.tag_id = $4))",
     )
     .bind(id)
     .bind(&pattern)
     .bind(&q.status)
+    .bind(q.tag_id)
     .fetch_one(&st.db)
     .await?;
+    let mut tags: std::collections::HashMap<i64, Vec<Value>> = Default::default();
+    if !rows.is_empty() {
+        let ids: Vec<String> = rows.iter().map(|r| r.0.to_string()).collect();
+        let tag_rows: Vec<(i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT s.id, t.id, t.name FROM subscriptions s JOIN subscriber_tags st ON st.subscriber_id = s.subscriber_id \
+             JOIN tags t ON t.id = st.tag_id WHERE s.id IN ({}) ORDER BY t.name",
+            ids.join(",")
+        )))
+        .fetch_all(&st.db)
+        .await?;
+        for (sid, tid, name) in tag_rows {
+            tags.entry(sid)
+                .or_default()
+                .push(json!({ "id": tid, "name": name }));
+        }
+    }
     let items: Vec<Value> = rows
         .into_iter()
         .map(|(id, email, name, status, subscriber_status, source, created_at, confirmed_at, unsubscribed_at)| {
             json!({ "id": id, "email": email, "name": name, "status": status, "subscriber_status": subscriber_status,
-                    "source": source, "created_at": created_at, "confirmed_at": confirmed_at, "unsubscribed_at": unsubscribed_at })
+                    "source": source, "created_at": created_at, "confirmed_at": confirmed_at, "unsubscribed_at": unsubscribed_at,
+                    "tags": tags.remove(&id).unwrap_or_default() })
         })
         .collect();
     Ok(Json(
@@ -627,6 +651,9 @@ pub async fn add_subscriber(
 #[derive(Deserialize)]
 pub struct ImportInput {
     pub csv: String,
+    /// Optional tag given to everyone in the file who is (or already was) subscribed.
+    #[serde(default)]
+    pub tag: String,
 }
 
 /// Imports `email[,name]` lines as confirmed subscribers. Suppressed addresses are skipped.
@@ -637,6 +664,11 @@ pub async fn import_subscribers(
     Json(i): Json<ImportInput>,
 ) -> J {
     let (list, _) = list_for(&st, &u, id).await?;
+    let tag_id = match i.tag.trim() {
+        "" => None,
+        t => Some(ensure_tag(&st.db, list.site_id, &tag_name(t)?).await?),
+    };
+    let ts = now();
     let (mut added, mut skipped, mut invalid) = (0, 0, 0);
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
@@ -674,9 +706,31 @@ pub async fn import_subscribers(
             invalid += 1;
             continue;
         }
-        match upsert_subscription(&st, &list, &email, &name, "", "import", true).await? {
+        let outcome = upsert_subscription(&st, &list, &email, &name, "", "import", true).await?;
+        let tag_it = matches!(
+            outcome,
+            crate::public::SubscribeOutcome::Confirmed
+                | crate::public::SubscribeOutcome::AlreadyConfirmed
+        );
+        match outcome {
             crate::public::SubscribeOutcome::Confirmed => added += 1,
             _ => skipped += 1,
+        }
+        if let (Some(t), true) = (tag_id, tag_it) {
+            // The tag and its event (what "gets a tag" triggers see) are saved together.
+            let mut tx = st.db.begin().await?;
+            let added: Option<(i64,)> = sqlx::query_as(
+                "INSERT INTO subscriber_tags (subscriber_id, tag_id, added_at) SELECT id, $1, $2 FROM subscribers \
+                 WHERE site_id = $3 AND email = $4 ON CONFLICT (subscriber_id, tag_id) DO NOTHING RETURNING subscriber_id",
+            )
+            .bind(t)
+            .bind(&ts)
+            .bind(list.site_id)
+            .bind(&email)
+            .fetch_optional(&mut *tx)
+            .await?;
+            record_tag_event(&mut *tx, added, t, &ts).await?;
+            tx.commit().await?;
         }
     }
     Ok(Json(
@@ -790,6 +844,157 @@ pub async fn admin_unsubscribe(
 }
 
 // ---------------------------------------------------------------------------------------
+// Tags (site-wide, on the person rather than one newsletter subscription)
+
+pub(crate) fn tag_name(raw: &str) -> AppResult<String> {
+    let n = raw.trim().to_lowercase();
+    if n.is_empty() || n.chars().count() > 50 || n.chars().any(|c| c.is_control()) {
+        return Err(AppError::bad_request("tag names are 1–50 characters"));
+    }
+    Ok(n)
+}
+
+/// Logs that someone got a tag (`added` is the subscriber from an insert that actually added it).
+pub(crate) async fn record_tag_event<'e, E: sqlx::Executor<'e, Database = sqlx::Any>>(
+    db: E,
+    added: Option<(i64,)>,
+    tag_id: i64,
+    ts: &str,
+) -> Result<(), sqlx::Error> {
+    if let Some((subscriber_id,)) = added {
+        sqlx::query("INSERT INTO tag_events (subscriber_id, tag_id, added_at) VALUES ($1, $2, $3)")
+            .bind(subscriber_id)
+            .bind(tag_id)
+            .bind(ts)
+            .execute(db)
+            .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn ensure_tag(db: &crate::db::Db, site_id: i64, name: &str) -> AppResult<i64> {
+    sqlx::query("INSERT INTO tags (site_id, name, created_at) VALUES ($1, $2, $3) ON CONFLICT (site_id, name) DO NOTHING")
+        .bind(site_id)
+        .bind(name)
+        .bind(now())
+        .execute(db)
+        .await?;
+    let (id,): (i64,) = sqlx::query_as("SELECT id FROM tags WHERE site_id = $1 AND name = $2")
+        .bind(site_id)
+        .bind(name)
+        .fetch_one(db)
+        .await?;
+    Ok(id)
+}
+
+async fn tags_json(st: &AppState, site_id: i64) -> J {
+    let rows: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT t.id, t.name, COUNT(st.subscriber_id) FROM tags t LEFT JOIN subscriber_tags st ON st.tag_id = t.id \
+         WHERE t.site_id = $1 GROUP BY t.id, t.name ORDER BY t.name",
+    )
+    .bind(site_id)
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(Value::Array(
+        rows.into_iter()
+            .map(|(id, name, n)| json!({ "id": id, "name": name, "subscribers": n }))
+            .collect(),
+    )))
+}
+
+pub async fn list_tags(State(st): State<AppState>, u: AuthUser, Path(id): Path<i64>) -> J {
+    site_for(&st, &u, id).await?;
+    tags_json(&st, id).await
+}
+
+#[derive(Deserialize)]
+pub struct TagInput {
+    pub name: String,
+}
+
+pub async fn create_tag(
+    State(st): State<AppState>,
+    u: AuthUser,
+    Path(id): Path<i64>,
+    Json(i): Json<TagInput>,
+) -> J {
+    site_for(&st, &u, id).await?;
+    let tag_id = ensure_tag(&st.db, id, &tag_name(&i.name)?).await?;
+    Ok(Json(json!({ "id": tag_id, "name": tag_name(&i.name)? })))
+}
+
+/// Deletes a tag from everyone. Automations that use it no longer match it.
+pub async fn delete_tag(State(st): State<AppState>, u: AuthUser, Path(id): Path<i64>) -> J {
+    let r = sqlx::query(
+        "DELETE FROM tags WHERE id = $1 AND site_id IN (SELECT id FROM sites WHERE account_id = $2)",
+    )
+    .bind(id)
+    .bind(u.account_id)
+    .execute(&st.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(AppError::not_found());
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn subscriber_tags_json(st: &AppState, subscription_id: i64) -> J {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT t.id, t.name FROM subscriptions s JOIN subscriber_tags st ON st.subscriber_id = s.subscriber_id \
+         JOIN tags t ON t.id = st.tag_id WHERE s.id = $1 ORDER BY t.name",
+    )
+    .bind(subscription_id)
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(Value::Array(
+        rows.into_iter()
+            .map(|(id, name)| json!({ "id": id, "name": name }))
+            .collect(),
+    )))
+}
+
+/// Tags a subscriber (creating the tag if needed); returns their tags.
+pub async fn tag_subscription(
+    State(st): State<AppState>,
+    u: AuthUser,
+    Path(id): Path<i64>,
+    Json(i): Json<TagInput>,
+) -> J {
+    let (_, site_id, _) = subscription_owner(&st, &u, id).await?;
+    let tag_id = ensure_tag(&st.db, site_id, &tag_name(&i.name)?).await?;
+    let ts = now();
+    let mut tx = st.db.begin().await?;
+    let added: Option<(i64,)> = sqlx::query_as(
+        "INSERT INTO subscriber_tags (subscriber_id, tag_id, added_at) SELECT subscriber_id, $2, $3 FROM subscriptions \
+         WHERE id = $1 ON CONFLICT (subscriber_id, tag_id) DO NOTHING RETURNING subscriber_id",
+    )
+    .bind(id)
+    .bind(tag_id)
+    .bind(&ts)
+    .fetch_optional(&mut *tx)
+    .await?;
+    record_tag_event(&mut *tx, added, tag_id, &ts).await?;
+    tx.commit().await?;
+    subscriber_tags_json(&st, id).await
+}
+
+pub async fn untag_subscription(
+    State(st): State<AppState>,
+    u: AuthUser,
+    Path((id, tag_id)): Path<(i64, i64)>,
+) -> J {
+    subscription_owner(&st, &u, id).await?;
+    sqlx::query(
+        "DELETE FROM subscriber_tags WHERE tag_id = $2 AND subscriber_id = (SELECT subscriber_id FROM subscriptions WHERE id = $1)",
+    )
+    .bind(id)
+    .bind(tag_id)
+    .execute(&st.db)
+    .await?;
+    subscriber_tags_json(&st, id).await
+}
+
+// ---------------------------------------------------------------------------------------
 // Campaigns
 
 #[derive(Deserialize)]
@@ -801,9 +1006,6 @@ pub struct CampaignInput {
     pub html_body: String,
     #[serde(default)]
     pub text_body: String,
-    /// Email-course lessons only: days after the subscriber confirmed.
-    #[serde(default)]
-    pub delay_days: Option<i64>,
 }
 
 pub(crate) async fn campaign_json(st: &AppState, c: &Campaign) -> AppResult<Value> {
@@ -814,8 +1016,16 @@ pub(crate) async fn campaign_json(st: &AppState, c: &Campaign) -> AppResult<Valu
     .bind(c.id)
     .fetch_one(&st.db)
     .await?;
+    let (opened, clicked): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT CASE WHEN kind IN ('open', 'click') THEN subscription_id END), \
+         COUNT(DISTINCT CASE WHEN kind = 'click' THEN subscription_id END) FROM engagements WHERE campaign_id = $1",
+    )
+    .bind(c.id)
+    .fetch_one(&st.db)
+    .await?;
     let mut v = serde_json::to_value(c).unwrap();
-    v["stats"] = json!({ "total": total, "sent": sent, "failed": failed, "skipped": skipped });
+    v["stats"] = json!({ "total": total, "sent": sent, "failed": failed, "skipped": skipped,
+                         "opened": opened, "clicked": clicked });
     Ok(v)
 }
 
@@ -826,7 +1036,7 @@ pub async fn list_campaigns(
 ) -> J {
     list_for(&st, &u, list_id).await?;
     let cs: Vec<Campaign> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {CAMPAIGN_COLS} FROM campaigns WHERE list_id = $1 AND sequence_id IS NULL ORDER BY id DESC"
+        "SELECT {CAMPAIGN_COLS} FROM campaigns WHERE list_id = $1 AND automation_id IS NULL ORDER BY id DESC"
     )))
     .bind(list_id)
     .fetch_all(&st.db)
@@ -872,12 +1082,8 @@ pub async fn update_campaign(
     Json(i): Json<CampaignInput>,
 ) -> J {
     let (c, _, _) = campaign_for(&st, &u, id).await?;
-    if c.sequence_id.is_some() {
-        // Course lessons stay editable: the worker renders each message from the current row.
-        let delay = i
-            .delay_days
-            .unwrap_or(c.delay_days)
-            .clamp(0, crate::drip::MAX_DELAY_DAYS);
+    if let Some(aid) = c.automation_id {
+        // Automation emails stay editable: the worker renders each message from the current row.
         // Whitespace-only counts as unwritten everywhere (the scheduler and the sender's claim).
         let blank = |v: &str| {
             if v.trim().is_empty() {
@@ -886,33 +1092,18 @@ pub async fn update_campaign(
                 v.to_string()
             }
         };
-        let seq_id = c.sequence_id.unwrap_or_default();
         let mut tx = st.db.begin().await?;
-        crate::drip::bump_revision(&mut tx, seq_id).await?;
-        // Re-read the day inside the transaction: the edit and the queue clean-up must agree.
-        let (old_delay,): (i64,) = sqlx::query_as("SELECT delay_days FROM campaigns WHERE id = $1")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE campaigns SET subject=$1, preheader=$2, html_body=$3, text_body=$4, delay_days=$5 WHERE id=$6")
-            .bind(i.subject.trim())
-            .bind(&i.preheader)
-            .bind(blank(&i.html_body))
-            .bind(&i.text_body)
-            .bind(delay)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        if delay != old_delay {
-            crate::drip::reopen(&mut tx, seq_id).await?;
-            // Not-yet-claimed sends were queued for the old day; the scheduler re-queues each
-            // subscriber when the new day comes. Same transaction, so the sender can't claim one
-            // in between.
-            sqlx::query("DELETE FROM campaign_sends WHERE campaign_id = $1 AND status = 'queued'")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        crate::automation::bump_revision(&mut tx, aid).await?;
+        sqlx::query(
+            "UPDATE campaigns SET subject=$1, preheader=$2, html_body=$3, text_body=$4 WHERE id=$5",
+        )
+        .bind(i.subject.trim())
+        .bind(&i.preheader)
+        .bind(blank(&i.html_body))
+        .bind(&i.text_body)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         return get_campaign(State(st), u, Path(id)).await;
     }
@@ -938,31 +1129,29 @@ pub async fn update_campaign(
 
 pub async fn delete_campaign(State(st): State<AppState>, u: AuthUser, Path(id): Path<i64>) -> J {
     let (c, _, _) = campaign_for(&st, &u, id).await?;
-    if c.sequence_id.is_some() {
-        // A lesson can go any time; its queued sends are deleted with it.
-        let mut tx = st.db.begin().await?;
-        crate::drip::bump_revision(&mut tx, c.sequence_id.unwrap_or_default()).await?;
-        sqlx::query("DELETE FROM campaigns WHERE id = $1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        return Ok(Json(json!({ "ok": true })));
+    if c.automation_id.is_some() {
+        return Err(AppError::bad_request(
+            "this email is a step of an automation; remove the step in the automation instead",
+        ));
     }
     if c.status == "sending" {
         return Err(AppError::bad_request(
             "pause the campaign before deleting it",
         ));
     }
+    let mut tx = st.db.begin().await?;
+    crate::automation::lock_list(&mut tx, c.list_id).await?;
+    crate::automation::check_unused(&mut tx, c.list_id, id, 0).await?;
     let r = sqlx::query("DELETE FROM campaigns WHERE id = $1 AND status <> 'sending'")
         .bind(id)
-        .execute(&st.db)
+        .execute(&mut *tx)
         .await?;
     if r.rows_affected() == 0 {
         return Err(AppError::bad_request(
             "pause the campaign before deleting it",
         ));
     }
+    tx.commit().await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1023,18 +1212,18 @@ pub async fn test_campaign(
 
 pub async fn send_campaign(State(st): State<AppState>, u: AuthUser, Path(id): Path<i64>) -> J {
     let (c, list, site) = campaign_for(&st, &u, id).await?;
-    if c.sequence_id.is_some() && c.status != "paused" {
+    if c.automation_id.is_some() && c.status != "paused" {
         return Err(AppError::bad_request(
-            "course lessons are sent automatically; start the course instead",
+            "automation emails are sent automatically; start the automation instead",
         ));
     }
-    if c.sequence_id.is_some() {
-        // Resuming a lesson only lets its queue drain again. Unlike a broadcast, its definitive
-        // failures stay failed: those subscribers have already moved on to later lessons.
+    if let Some(aid) = c.automation_id {
+        // Resuming an automation email only lets its queue drain again. Unlike a broadcast, its
+        // definitive failures stay failed: those subscribers have already moved on.
         mailer::provider_for(&site, &st.http)
             .map_err(|e| AppError::bad_request(format!("{e:#}")))?;
         let mut tx = st.db.begin().await?;
-        crate::drip::bump_revision(&mut tx, c.sequence_id.unwrap_or_default()).await?;
+        crate::automation::bump_revision(&mut tx, aid).await?;
         sqlx::query("UPDATE campaigns SET status = 'sending' WHERE id = $1 AND status = 'paused'")
             .bind(id)
             .execute(&mut *tx)

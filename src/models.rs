@@ -87,15 +87,13 @@ pub struct Campaign {
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
-    /// Set for an email-course lesson; None for a regular (broadcast) campaign.
-    pub sequence_id: Option<i64>,
-    /// Lessons only: days after the subscriber confirmed.
-    pub delay_days: i64,
+    /// Set for an email step of an automation; None for a regular (broadcast) campaign.
+    pub automation_id: Option<i64>,
 }
 
 pub const CAMPAIGN_COLS: &str =
     "id, list_id, subject, preheader, html_body, text_body, status, created_at, started_at, finished_at, \
-    sequence_id, delay_days";
+    automation_id";
 
 pub struct Recipient<'a> {
     pub email: &'a str,

@@ -25,6 +25,9 @@ info:
       `complained` or `suppressed`; anything but `active` is never emailed.
     - **Campaign**: one email sent to every confirmed subscriber of a list:
       `draft` → `sending` → `sent` (or `paused`).
+    - **Automation**: a trigger plus a flowchart of steps (emails, waits, if/else, tags, goals)
+      that each subscriber goes through once, e.g. a welcome series or an email course.
+    - **Tag**: a label on a person, site-wide; used by automations.
 
     ## Authentication
 
@@ -80,12 +83,41 @@ tags:
     description: People subscribed to a list.
   - name: Campaigns
     description: Emails sent to a list.
-  - name: Email courses
+  - name: Automations
     description: |
-      Drip sequences: lessons sent automatically on day N after each subscriber confirms. Each lesson
-      is a campaign (`sequence_id` set) edited with the campaign endpoints. Subscribers who confirm
-      after the course is first started are enrolled (CSV imports are not); lessons go out in
-      `delay_days` order at the time of day the person signed up.
+      A trigger plus a flowchart of steps each subscriber goes through once, e.g. a welcome series or
+      an email course. **Triggers**: `subscribed` (confirms their subscription; CSV imports only with
+      `include_imports`), `tag_added`, `clicked` (a link in a campaign) and `manual` (only people
+      added with `POST /api/automations/{id}/enroll`). Triggers only count events after the
+      automation was first started.
+
+      **Steps** (`steps` is an array; an `if/else` step holds its own `yes` and `no` arrays, and
+      both carry on with the steps after it). Every step has a unique string `id`:
+
+      - `{"type":"email","campaign_id":12}`: send an email. Create it with
+        `POST /api/automations/{id}/emails` and edit it with the campaign endpoints.
+      - `{"type":"wait","amount":2,"unit":"days"}` (`minutes`, `hours`, `days`, `weeks`). With
+        `"until": <condition>` it ends as soon as the condition is met, or after `amount` at the
+        latest (`amount: 0` = no limit).
+      - `{"type":"branch","condition":<condition>,"yes":[…],"no":[…]}`: if/else.
+      - `{"type":"tag","action":"add"|"remove","tag_id":3}`
+      - `{"type":"list","action":"subscribe"|"unsubscribe","list_id":2}`: another newsletter on the
+        same site. Subscribing skips double opt-in (you vouch for consent) and never re-subscribes
+        someone who unsubscribed from it. Unsubscribing them from this newsletter ends the automation.
+      - `{"type":"goal","name":"Bought","condition":<condition>,"unmet":"continue"|"wait"|"exit"}`:
+        anyone earlier in the flow who meets the condition jumps straight past the goal. `unmet` is
+        what happens to people who reach it without meeting it.
+      - `{"type":"exit"}`: ends the automation for them.
+
+      **Conditions**: `{"type":"opened","campaign_id":…}` (approximate: some mail apps load images
+      automatically), `{"type":"clicked","campaign_id":…,"url":"…"}` (`url` optional),
+      `{"type":"has_tag","tag_id":…}`, `{"type":"on_list","list_id":…}`.
+
+      People who can't receive mail (unsubscribed, bounced) wait where they are and continue if they
+      come back. Editing a running automation is safe: people at a removed step continue from what
+      came after it.
+  - name: Tags
+    description: Labels on people (site-wide). Used by automation triggers, conditions and steps.
   - name: Integrations
     description: |
       Connected cloud accounts used for automatic setup: an **AWS setup key** (see
@@ -841,6 +873,7 @@ paths:
         - { name: q, in: query, schema: { type: string }, description: Case-insensitive substring of email or name. }
         - { name: status, in: query, schema: { $ref: '#/components/schemas/SubscriptionStatus' }, description: Filter by subscription status. }
         - { name: page, in: query, schema: { type: integer, minimum: 0, default: 0 }, description: Zero-based page (50 per page). }
+        - { name: tag_id, in: query, schema: { type: integer }, description: Only people with this tag. }
       responses:
         '200':
           description: One page of subscriptions, newest first.
@@ -900,6 +933,7 @@ paths:
               required: [csv]
               properties:
                 csv: { type: string, example: "email,name\njane@example.com,Jane\n" }
+                tag: { type: string, description: 'Optional: tag everyone in the file who is (or already was) subscribed, e.g. to start an automation with a `tag_added` trigger.' }
       responses:
         '200':
           description: Import summary.
@@ -923,43 +957,49 @@ paths:
           content:
             text/csv:
               schema: { type: string }
-  /api/lists/{id}/sequences:
+  /api/lists/{id}/automations:
     parameters: [{ $ref: '#/components/parameters/ListId' }]
     get:
-      tags: [Email courses]
-      operationId: listSequences
-      summary: List a newsletter's email courses
+      tags: [Automations]
+      operationId: listAutomations
+      summary: List a newsletter's automations
       responses:
         '200':
-          description: Courses with their lessons and enrollment counts.
-          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Sequence' } } } }
+          description: Automations with their flowchart and enrollment counts.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Automation' } } } }
     post:
-      tags: [Email courses]
-      operationId: createSequence
-      summary: Create an email course (as a draft)
+      tags: [Automations]
+      operationId: createAutomation
+      summary: Create an automation (as a draft)
       requestBody:
         content:
           application/json:
-            schema: { type: object, properties: { name: { type: string, example: 7-day budgeting course } } }
+            schema:
+              type: object
+              properties:
+                name: { type: string, example: Welcome series }
+                trigger: { $ref: '#/components/schemas/AutomationTrigger' }
       responses:
-        '200': { description: The course., content: { application/json: { schema: { $ref: '#/components/schemas/Sequence' } } } }
-  /api/sequences/{id}:
+        '200': { description: The automation., content: { application/json: { schema: { $ref: '#/components/schemas/AutomationDetail' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/automations/{id}:
     parameters: [{ $ref: '#/components/parameters/Id' }]
     get:
-      tags: [Email courses]
-      operationId: getSequence
-      summary: Get an email course
+      tags: [Automations]
+      operationId: getAutomation
+      summary: Get an automation with its emails and where people are
       responses:
-        '200': { description: The course., content: { application/json: { schema: { $ref: '#/components/schemas/Sequence' } } } }
+        '200': { description: The automation., content: { application/json: { schema: { $ref: '#/components/schemas/AutomationDetail' } } } }
         '404': { $ref: '#/components/responses/NotFound' }
     put:
-      tags: [Email courses]
-      operationId: updateSequence
-      summary: Rename, start or pause an email course
+      tags: [Automations]
+      operationId: updateAutomation
+      summary: Edit, start or pause an automation
       description: |
-        `status: active` starts (or resumes) the course; it needs the site's mailing address, a working
-        provider and at least one written lesson. `paused` stops new lessons going out; subscribers who
-        sign up meanwhile are enrolled when it resumes.
+        Send any of the fields. `steps` replaces the whole flowchart; emails no longer in it are
+        deleted. `status: active` starts (or resumes) it: it needs the site's mailing address, a working
+        provider, at least one step and every email written. `paused` stops it; triggered people are
+        enrolled when it resumes.
       requestBody:
         required: true
         content:
@@ -968,23 +1008,25 @@ paths:
               type: object
               properties:
                 name: { type: string }
+                trigger: { $ref: '#/components/schemas/AutomationTrigger' }
+                steps: { type: array, items: { $ref: '#/components/schemas/AutomationStep' } }
                 status: { type: string, enum: [active, paused] }
       responses:
-        '200': { description: The course., content: { application/json: { schema: { $ref: '#/components/schemas/Sequence' } } } }
+        '200': { description: The automation., content: { application/json: { schema: { $ref: '#/components/schemas/AutomationDetail' } } } }
         '400': { $ref: '#/components/responses/Error' }
     delete:
-      tags: [Email courses]
-      operationId: deleteSequence
-      summary: Delete an email course and its lessons
+      tags: [Automations]
+      operationId: deleteAutomation
+      summary: Delete an automation and its emails
       responses:
-        '200': { description: Deleted., content: { application/json: { schema: { type: object, properties: { ok: { type: boolean } } } } } }
-  /api/sequences/{id}/lessons:
+        '200': { $ref: '#/components/responses/Ok' }
+  /api/automations/{id}/emails:
     parameters: [{ $ref: '#/components/parameters/Id' }]
     post:
-      tags: [Email courses]
-      operationId: addSequenceLesson
-      summary: Add a lesson
-      description: Creates the lesson's campaign. Without `delay_days` it goes one day after the current last lesson (day 0 for the first). Edit it with `PUT /api/campaigns/{id}`.
+      tags: [Automations]
+      operationId: createAutomationEmail
+      summary: Create an email for an email step
+      description: Then reference its `id` in an `email` step with `PUT /api/automations/{id}` (emails not in the flowchart are deleted on the next save). Edit it with `PUT /api/campaigns/{id}`.
       requestBody:
         content:
           application/json:
@@ -992,9 +1034,83 @@ paths:
               type: object
               properties:
                 subject: { type: string }
-                delay_days: { type: integer, minimum: 0, maximum: 3650 }
+                html_body: { type: string }
       responses:
         '200': { $ref: '#/components/responses/Campaign' }
+  /api/automations/{id}/enroll:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Automations]
+      operationId: enrollInAutomation
+      summary: Add existing subscribers to an automation
+      description: Adds confirmed subscribers of the newsletter (all, or those with a tag) at the first step. People already in it, or who went through it, are skipped. They start moving once the automation is active.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target]
+              properties:
+                target: { type: string, enum: [all, tag] }
+                tag_id: { type: integer, description: Required when target is `tag`. }
+      responses:
+        '200': { description: How many were added., content: { application/json: { schema: { type: object, properties: { enrolled: { type: integer } } } } } }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/sites/{id}/tags:
+    parameters: [{ $ref: '#/components/parameters/SiteId' }]
+    get:
+      tags: [Tags]
+      operationId: listTags
+      summary: List a site's tags
+      responses:
+        '200':
+          description: Tags with how many people have each.
+          content:
+            application/json:
+              schema: { type: array, items: { type: object, properties: { id: { type: integer }, name: { type: string }, subscribers: { type: integer } } } }
+    post:
+      tags: [Tags]
+      operationId: createTag
+      summary: Create a tag (or get the existing one)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TagInput' } } }
+      responses:
+        '200': { description: The tag., content: { application/json: { schema: { $ref: '#/components/schemas/Tag' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/tags/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    delete:
+      tags: [Tags]
+      operationId: deleteTag
+      summary: Delete a tag from everyone
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/subscriptions/{id}/tags:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Tags]
+      operationId: tagSubscriber
+      summary: Tag a subscriber
+      description: Creates the tag if needed. Tags belong to the person, across the site's newsletters.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TagInput' } } }
+      responses:
+        '200': { description: Their tags., content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Tag' } } } } }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/subscriptions/{id}/tags/{tag_id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+      - { name: tag_id, in: path, required: true, schema: { type: integer } }
+    delete:
+      tags: [Tags]
+      operationId: untagSubscriber
+      summary: Remove a tag from a subscriber
+      responses:
+        '200': { description: Their tags., content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Tag' } } } } }
   /api/subscriptions/{id}:
     parameters: [{ $ref: '#/components/parameters/Id' }]
     delete:
@@ -1062,7 +1178,7 @@ paths:
     put:
       tags: [Campaigns]
       operationId: updateCampaign
-      summary: Edit a draft or an email-course lesson
+      summary: Edit a draft or an automation email
       requestBody:
         required: true
         content:
@@ -1185,6 +1301,30 @@ paths:
       responses:
         '200': { description: Allowed. }
         '404': { description: Not a known hostname. }
+  /c/{key}/{token}:
+    parameters:
+      - { name: key, in: path, required: true, schema: { type: string }, description: The link's random key. }
+      - { $ref: '#/components/parameters/Token' }
+    get:
+      tags: [Public]
+      operationId: trackedLink
+      summary: Tracked link in an email
+      description: Records the click and redirects to the link's URL.
+      security: []
+      responses:
+        '303': { description: Redirect to the link. }
+        '404': { description: Unknown link. }
+  /o/{campaign_id}/{token}:
+    parameters:
+      - { name: campaign_id, in: path, required: true, schema: { type: integer } }
+      - { $ref: '#/components/parameters/Token' }
+    get:
+      tags: [Public]
+      operationId: openPixel
+      summary: Open-tracking pixel
+      security: []
+      responses:
+        '200': { description: A 1×1 transparent GIF., content: { image/gif: { schema: { type: string, format: binary } } } }
   /confirm/{token}:
     parameters: [{ $ref: '#/components/parameters/Token' }]
     get:
@@ -1434,7 +1574,8 @@ components:
         name: { type: string }
         status: { $ref: '#/components/schemas/SubscriptionStatus' }
         subscriber_status: { type: string, enum: [active, bounced, complained, suppressed], description: Site-wide status; only `active` receives email. }
-        source: { type: string, enum: [form, admin, import] }
+        source: { type: string, enum: [form, admin, import, automation] }
+        tags: { type: array, items: { $ref: '#/components/schemas/Tag' } }
         created_at: { type: string, format: date-time }
         confirmed_at: { type: [string, 'null'], format: date-time }
         unsubscribed_at: { type: [string, 'null'], format: date-time }
@@ -1452,7 +1593,6 @@ components:
             `{{unsubscribe_url}}`. Values are HTML-escaped. Wrapped in a responsive layout with the
             compliance footer.
         text_body: { type: string, description: Plain-text alternative. Generated from the HTML when blank. }
-        delay_days: { type: integer, minimum: 0, description: 'Email-course lessons only: days after the subscriber confirmed (0 = right away).' }
     Campaign:
       type: object
       properties:
@@ -1466,9 +1606,56 @@ components:
         created_at: { type: string, format: date-time }
         started_at: { type: [string, 'null'], format: date-time }
         finished_at: { type: [string, 'null'], format: date-time }
-        sequence_id: { type: [integer, 'null'], description: The email course this lesson belongs to; null for a regular campaign. }
-        delay_days: { type: integer, description: 'Lessons: days after the subscriber confirmed.' }
-    Sequence:
+        automation_id: { type: [integer, 'null'], description: 'The automation this email step belongs to; null for a regular campaign. Its status is `sending` (live) or `paused` (stopped after repeated send failures; resume with POST /api/campaigns/{id}/send).' }
+    Tag:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string, description: Lowercase. }
+    TagInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 50, example: vip }
+    AutomationTrigger:
+      type: object
+      required: [type]
+      description: See the Automations tag for the meaning of each trigger.
+      properties:
+        type: { type: string, enum: [subscribed, tag_added, clicked, manual] }
+        include_imports: { type: boolean, description: '`subscribed`: also enroll CSV imports.' }
+        tag_id: { type: integer, description: '`tag_added`' }
+        campaign_id: { type: integer, description: '`clicked`: a campaign of this newsletter.' }
+        url: { type: string, description: '`clicked`: only this link (blank = any).' }
+    AutomationCondition:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, enum: [opened, clicked, has_tag, on_list] }
+        campaign_id: { type: integer }
+        url: { type: string }
+        tag_id: { type: integer }
+        list_id: { type: integer }
+    AutomationStep:
+      type: object
+      required: [id, type]
+      description: See the Automations tag for each step type and its fields.
+      properties:
+        id: { type: string, maxLength: 64, description: Unique within the automation; keep it stable across edits (it's where people are). }
+        type: { type: string, enum: [email, wait, branch, tag, list, goal, exit] }
+        campaign_id: { type: integer }
+        amount: { type: integer, minimum: 0 }
+        unit: { type: string, enum: [minutes, hours, days, weeks] }
+        until: { $ref: '#/components/schemas/AutomationCondition' }
+        condition: { $ref: '#/components/schemas/AutomationCondition' }
+        yes: { type: array, items: { $ref: '#/components/schemas/AutomationStep' } }
+        no: { type: array, items: { $ref: '#/components/schemas/AutomationStep' } }
+        action: { type: string, enum: [add, remove, subscribe, unsubscribe] }
+        tag_id: { type: integer }
+        list_id: { type: integer }
+        name: { type: string }
+        unmet: { type: string, enum: [continue, wait, exit] }
+    Automation:
       type: object
       properties:
         id: { type: integer }
@@ -1476,14 +1663,22 @@ components:
         name: { type: string }
         status: { type: string, enum: [draft, active, paused] }
         created_at: { type: string, format: date-time }
-        started_at: { type: [string, 'null'], format: date-time, description: First start; only subscribers confirmed from then on are enrolled. }
-        lessons: { type: array, items: { $ref: '#/components/schemas/CampaignWithStats' }, description: 'Ordered by delay_days. Lesson status is `sending` (live) or `paused` (stopped after repeated send failures; resume it with POST /api/campaigns/{id}/send).' }
+        started_at: { type: [string, 'null'], format: date-time, description: First start; triggers only count events from then on. }
+        trigger: { $ref: '#/components/schemas/AutomationTrigger' }
+        steps: { type: array, items: { $ref: '#/components/schemas/AutomationStep' } }
         stats:
           type: object
           properties:
             enrolled: { type: integer }
-            completed: { type: integer }
             in_progress: { type: integer }
+            completed: { type: integer }
+    AutomationDetail:
+      allOf:
+        - $ref: '#/components/schemas/Automation'
+        - type: object
+          properties:
+            emails: { type: object, additionalProperties: { $ref: '#/components/schemas/CampaignWithStats' }, description: The email steps' campaigns by id. }
+            at_step: { type: object, additionalProperties: { type: integer }, description: How many people are at each step (by step id) right now. }
     CampaignWithStats:
       allOf:
         - $ref: '#/components/schemas/Campaign'
@@ -1496,6 +1691,8 @@ components:
                 sent: { type: integer }
                 failed: { type: integer }
                 skipped: { type: integer, description: Unsubscribed or suppressed before their turn. }
+                opened: { type: integer, description: 'People who opened it (approximate) or clicked a link.' }
+                clicked: { type: integer, description: People who clicked a link. }
     EmailEvent:
       type: object
       properties:
